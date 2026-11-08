@@ -1,0 +1,220 @@
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+
+// --- Pines de Hardware ---
+const int PIN_OK = 2;   
+const int PIN_ESC = 3;  
+const int JOY_X = A0;
+const int JOY_Y = A1;
+
+// --- Variables Globales ---
+float cursorX = 64, cursorY = 32;
+int currentApp = -1; 
+int selectedIcon = -1;
+
+void setup() {
+  pinMode(PIN_OK, INPUT_PULLUP);
+  pinMode(PIN_ESC, INPUT_PULLUP);
+  if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) for(;;);
+  bootWin10(); 
+}
+
+void loop() {
+  if (currentApp == -1) {
+    updateDesktop();
+    drawDesktop();
+  } else {
+    if (currentApp == 0) runFullCalc(); 
+    if (currentApp == 1) runAdvancedTimer(); 
+    if (currentApp == 2) runSettings(); 
+  }
+}
+
+// ==========================================
+// SISTEMA: BOOT & ESCRITORIO
+// ==========================================
+void bootWin10() {
+  for(int frame = 0; frame < 10; frame++) {
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(1);
+    display.setCursor(35, 20); display.print(F("Arduino OS"));
+    for(int i=0; i<8; i++) {
+      float angle = (frame * 0.4) + (i * 0.8);
+      display.fillCircle(64 + cos(angle)*12, 45 + sin(angle)*10, 1, 1);
+    }
+    display.display(); delay(100);
+  }
+}
+
+void updateDesktop() {
+  int vx = analogRead(JOY_X); int vy = analogRead(JOY_Y);
+  if(vx < 400) cursorX -= 4; else if(vx > 600) cursorX += 4;
+  if(vy < 400) cursorY += 4; else if(vy > 600) cursorY -= 4; // EJE Y INVERTIDO
+  cursorX = constrain(cursorX, 0, 120); cursorY = constrain(cursorY, 0, 54);
+  selectedIcon = -1;
+  if (cursorY > 10 && cursorY < 35) {
+    if (cursorX < 42) selectedIcon = 0; else if (cursorX < 84) selectedIcon = 1; else selectedIcon = 2;
+  }
+  if (digitalRead(PIN_OK) == LOW && selectedIcon != -1) { currentApp = selectedIcon; delay(300); }
+}
+
+void drawDesktop() {
+  display.clearDisplay();
+  if(selectedIcon == 0) display.drawRect(8, 8, 30, 22, 1);
+  display.setCursor(12, 15); display.print(F("CALC"));
+  if(selectedIcon == 1) display.drawRect(50, 8, 30, 22, 1);
+  display.setCursor(54, 15); display.print(F("TIME"));
+  if(selectedIcon == 2) display.drawRect(92, 8, 30, 22, 1);
+  display.setCursor(94, 15); display.print(F("CONF")); 
+  display.fillRect(0, 56, 128, 8, 1);
+  display.setTextColor(0); display.setCursor(2, 57); display.print(F("START"));
+  display.setCursor(75, 57); display.print(F("Arduino OS"));
+  display.setTextColor(1);
+  display.fillTriangle(cursorX, cursorY, cursorX, cursorY+7, cursorX+5, cursorY+5, 1);
+  display.display();
+}
+
+// ==========================================
+// APP: CALCULADORA (SIGNO IGUAL CORREGIDO)
+// ==========================================
+void runFullCalc() {
+  long result = 0, currentNum = 0;
+  char lastOp = ' ';
+  String displayBuffer = "0";
+
+  struct Btn { int x, y, w, h; char val; const char* label; };
+  Btn b[] = {
+    {2,14,22,11,'7',"7"}, {26,14,22,11,'8',"8"}, {50,14,22,11,'9',"9"}, {76,14,22,11,'+',"+"}, {100,14,24,11,'x',"x"},
+    {2,27,22,11,'4',"4"}, {26,27,22,11,'5',"5"}, {50,27,22,11,'6',"6"}, {76,27,22,11,'-',"-"}, {100,27,24,11,'/',"/"},
+    {2,40,22,11,'1',"1"}, {26,40,22,11,'2',"2"}, {50,40,22,11,'3',"3"}, {76,40,22,11,'=',"="}, {100,40,24,11,'C', "C"},
+    {2,53,70,10,'0',"   0"} // Cero que abarca 3 líneas
+  };
+
+  while(digitalRead(PIN_ESC) == HIGH) {
+    display.clearDisplay();
+    display.drawRect(0, 0, 128, 13, 1);
+    display.setCursor(5, 3); display.print(displayBuffer);
+
+    for(int i=0; i<16; i++) {
+      display.drawRect(b[i].x, b[i].y, b[i].w, b[i].h, 1);
+      display.setCursor(b[i].x+7, b[i].y+2); display.print(b[i].label);
+    }
+
+    int vx = analogRead(JOY_X); int vy = analogRead(JOY_Y);
+    if(vx < 400) cursorX -= 3; else if(vx > 600) cursorX += 3;
+    if(vy < 400) cursorY += 3; else if(vy > 600) cursorY -= 3;
+    cursorX = constrain(cursorX, 0, 120); cursorY = constrain(cursorY, 0, 60);
+    display.fillCircle(cursorX, cursorY, 1, 1); // Puntero de precisión
+    
+    if(digitalRead(PIN_OK) == LOW) {
+      for(int i=0; i<16; i++) {
+        if(cursorX >= b[i].x && cursorX <= b[i].x+b[i].w && cursorY >= b[i].y && cursorY <= b[i].y+b[i].h) {
+          char val = b[i].val;
+          if(val >= '0' && val <= '9') {
+            currentNum = (currentNum * 10) + (val - '0');
+            displayBuffer = String(currentNum);
+          } else if(val == '+' || val == '-' || val == 'x' || val == '/') {
+            result = currentNum; currentNum = 0; lastOp = val; displayBuffer = String(val);
+          } else if(val == '=') {
+            if(lastOp == '+') result += currentNum; 
+            else if(lastOp == '-') result -= currentNum;
+            else if(lastOp == 'x') result *= currentNum;
+            else if(lastOp == '/' && currentNum != 0) result /= currentNum;
+            displayBuffer = String(result);
+            currentNum = result; // Permite seguir operando sobre el resultado
+            lastOp = ' ';
+          } else if(val == 'C') {
+            currentNum = 0; result = 0; lastOp = ' '; displayBuffer = "0";
+          }
+          delay(250);
+        }
+      }
+    }
+    display.display();
+  }
+  currentApp = -1; delay(300);
+}
+
+// ==========================================
+// APP: CRONÓMETRO (DISEÑO MEJORADO)
+// ==========================================
+void runAdvancedTimer() {
+  unsigned long startT = 0, elapsed = 0;
+  bool running = false;
+  while(digitalRead(PIN_ESC) == HIGH) {
+    if(running) elapsed = (millis() - startT) / 1000;
+    
+    display.clearDisplay();
+    display.drawRect(0, 0, 128, 64, 1); // Marco de App
+    display.fillRect(0, 0, 128, 10, 1); // Barra de título
+    display.setTextColor(0); display.setCursor(3, 1); display.print(F("STOPWATCH PRO"));
+    display.setTextColor(1);
+    
+    // Diseño de reloj circular visual
+    display.drawCircle(30, 35, 15, 1);
+    float angle = (elapsed % 60) * 0.1047; // 2PI / 60
+    display.drawLine(30, 35, 30 + cos(angle-1.57)*12, 35 + sin(angle-1.57)*12, 1);
+
+    display.setTextSize(2);
+    display.setCursor(60, 28); display.print(elapsed); display.print(F("s"));
+    
+    display.setTextSize(1);
+    display.drawRect(60, 48, 60, 12, 1);
+    display.setCursor(65, 50); display.print(running ? F("STOP") : F("START"));
+    
+    if(digitalRead(PIN_OK) == LOW) {
+      if(!running) { startT = millis() - (elapsed * 1000); running = true; }
+      else { running = false; }
+      delay(300);
+    }
+    display.display();
+  }
+  currentApp = -1; delay(300);
+}
+
+// ==========================================
+// CONFIGURACIÓN & STICK
+// ==========================================
+void runSettings() {
+  int subMenu = 0;
+  while(digitalRead(PIN_ESC) == HIGH) {
+    display.clearDisplay();
+    display.setCursor(0,0); display.println(F("CONFIGURACION"));
+    display.drawLine(0, 10, 128, 10, 1);
+    display.setCursor(10, 22); if(subMenu == 0) display.print(F("> ")); display.print(F("ESPECIFICACIONES"));
+    display.setCursor(10, 36); if(subMenu == 1) display.print(F("> ")); display.print(F("STICK TEST"));
+    int vy = analogRead(JOY_Y);
+    if(vy < 400) { subMenu = 1; delay(200); }
+    if(vy > 600) { subMenu = 0; delay(200); }
+    if(digitalRead(PIN_OK) == LOW) {
+      delay(200);
+      if(subMenu == 0) { 
+        while(digitalRead(PIN_ESC) == HIGH) {
+          display.clearDisplay(); display.setCursor(0,0); 
+          display.println(F("HARDWARE SPECS:"));
+          display.println(F("ATmega328P @16MHz"));
+          display.println(F("Flash: 32KB"));
+          display.println(F("Display: SSD1306"));
+          display.display();
+        }
+      } else runStickGraph();
+    }
+    display.display();
+  }
+  currentApp = -1; delay(300);
+}
+
+void runStickGraph() {
+  while(digitalRead(PIN_ESC) == HIGH) {
+    int rx = analogRead(JOY_X); int ry = analogRead(JOY_Y);
+    int gX = map(rx, 0, 1023, 34, 94); int gY = map(ry, 0, 1023, 14, 50);
+    display.clearDisplay(); display.drawRect(34, 14, 60, 36, 1); 
+    display.fillCircle(gX, gY, 3, 1); display.display();
+  }
+}
