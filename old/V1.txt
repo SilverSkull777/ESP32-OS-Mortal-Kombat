@@ -1,0 +1,58 @@
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET    -1 // Configuración típica, -1 si no se usa pin de reset
+#define SCREEN_ADDRESS 0x3C // Dirección I2C de la pantalla OLED
+
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+void setup() {
+  // Iniciar la pantalla OLED
+  if (!display.begin(SCREEN_ADDRESS)) {
+    Serial.println(F("Error al iniciar OLED"));
+    for (;;); // Detiene la ejecución si falla la inicialización
+  }
+
+  display.clearDisplay();
+  display.display();
+
+  // Pantalla de inicio
+  display.setTextSize(2);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(20, 20); // Centra "ArduinoOS" en la pantalla
+  display.println("ArduinoOS");
+  display.setTextSize(1);
+  display.setCursor(20, 50); // Coloca el texto pequeño en la parte inferior
+  display.println("Created By:???????");
+  display.display();
+
+  // Generar tiempo aleatorio de espera
+  int loadTime = random(1000, 5000); // Tiempo entre 1 y 5 segundos
+  delay(loadTime);
+
+  // Efecto tipo Matrix
+  displayMatrixEffect();
+}
+
+void loop() {
+  // Aquí podrías agregar más funcionalidad si lo deseas
+}
+
+void displayMatrixEffect() {
+  while (true) {
+    display.clearDisplay();
+    for (int i = 0; i < 10; i++) {
+      int x = random(0, SCREEN_WIDTH);
+      int y = random(0, SCREEN_HEIGHT);
+      char symbol = random(33, 127); // Caracter ASCII aleatorio
+      display.setTextSize(1);
+      display.setTextColor(SSD1306_WHITE);
+      display.setCursor(x, y);
+      display.print(symbol);
+    }
+    display.display();
+    delay(100); // Velocidad del efecto Matrix
+  }
+}

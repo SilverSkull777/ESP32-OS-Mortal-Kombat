@@ -1,0 +1,63 @@
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET    -1
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+void setup() {
+  randomSeed(analogRead(0)); // Inicializar aleatoriedad
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    for (;;);
+  }
+  display.clearDisplay();
+
+  // Simulación de carga con tiempo aleatorio
+  int loadTime = random(1000, 10000); // Entre 1 y 10 segundos
+  display.setTextSize(2); // Tamaño grande para ArduinoOS
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor((SCREEN_WIDTH - 100) / 2, 5); // Subir más las letras
+  display.print("ArduinoOS");
+  display.setTextSize(1); // Tamaño pequeño para Created By
+  display.setCursor((SCREEN_WIDTH - 84) / 2, 25); // Subir más
+  display.print("Created By: ?????"); // Quitar un signo de interrogación
+  
+  // Animar círculo de carga tipo Windows con un punto faltante
+  unsigned long startTime = millis();
+  while (millis() - startTime < loadTime) {
+    display.clearDisplay();
+    display.setTextSize(2);
+    display.setCursor((SCREEN_WIDTH - 100) / 2, 5);
+    display.print("ArduinoOS");
+    display.setTextSize(1);
+    display.setCursor((SCREEN_WIDTH - 84) / 2, 25);
+    display.print("Created By: ?????");
+    for (int i = 0; i < 7; i++) { // Solo 7 puntos para dejar un espacio vacío
+      int x = SCREEN_WIDTH / 2 + cos((i + millis() / 100) * PI / 4) * 8;
+      int y = 45 + sin((i + millis() / 100) * PI / 4) * 8; // Ajustar la posición del círculo más abajo
+      display.fillCircle(x, y, 2, SSD1306_WHITE);
+    }
+    display.display();
+    delay(100);
+  }
+
+  // Iniciar efecto Matrix
+  matrixEffect();
+}
+
+void loop() {}
+
+void matrixEffect() {
+  display.clearDisplay();
+  while (true) {
+    display.clearDisplay();
+    for (int i = 0; i < SCREEN_WIDTH; i += 6) {
+      int randomHeight = random(10, SCREEN_HEIGHT); // Líneas más largas para llegar hasta abajo
+      display.drawLine(i, 0, i, randomHeight, SSD1306_WHITE);
+    }
+    display.display();
+    delay(30); // Movimiento más fluido
+  }
+}

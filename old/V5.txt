@@ -1,0 +1,180 @@
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <Arduino.h>
+
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET    -1
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// Variables para el cursor (mouse) y joystick
+int cursorX = SCREEN_WIDTH / 2;
+int cursorY = SCREEN_HEIGHT / 2;
+const int selectButtonPin = 2; // Botón para abrir apps
+const int exitButtonPin = 3;   // Botón para salir de las apps
+int joystickX = 0;
+int joystickY = 0;
+bool inApp = false; // Bandera para determinar si estamos dentro de una app
+
+void setup() {
+  pinMode(selectButtonPin, INPUT_PULLUP); // Configurar botón de selección como entrada
+  pinMode(exitButtonPin, INPUT_PULLUP);   // Configurar botón de salida como entrada
+  pinMode(A0, INPUT); // Joystick eje X
+  pinMode(A1, INPUT); // Joystick eje Y
+
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    for (;;); // Bucle infinito si falla la pantalla
+  }
+  display.clearDisplay();
+
+  // Mostrar pantalla de carga
+  showLoadingScreen();
+
+  // Mostrar íconos y el mouse
+  display.clearDisplay();
+  setupIconsAndText();
+  drawMouse();
+  display.display();
+}
+
+void showLoadingScreen() {
+  String title = "ArduinoOS";
+  int loadTime = random(2000, 5000); // Tiempo aleatorio entre 2 y 5 segundos
+  unsigned long startTime = millis();
+
+  // Mostrar el texto "ArduinoOS" completo desde el principio
+  display.setTextSize(2);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor((SCREEN_WIDTH - 100) / 2, 5);
+  display.print(title);
+  display.display();
+
+  // Círculo de carga tipo Windows
+  while (millis() - startTime < loadTime) {
+    display.clearDisplay();
+    display.setCursor((SCREEN_WIDTH - 100) / 2, 5);
+    display.print(title);
+    for (int i = 0; i < 8; i++) {
+      float angle = (millis() / 75.0) + (PI / 4 * i); // Velocidad ajustada
+      int x = SCREEN_WIDTH / 2 + cos(angle) * 8;
+      int y = 45 + sin(angle) * 8;
+      display.fillCircle(x, y, 2, SSD1306_WHITE);
+    }
+    display.display();
+    delay(30);
+  }
+}
+
+void setupIconsAndText() {
+  // Centrar íconos y texto en la pantalla
+  display.setTextSize(1);
+
+  // Ícono 1 (Calc)
+  display.setCursor(19, 40); // Centrado horizontalmente respecto al rectángulo
+  display.print("Calc");
+  display.drawRect(14, 25, 30, 15, SSD1306_WHITE);
+
+  // Ícono 2 (Hack)
+  display.setCursor(54, 40); // Centrado horizontalmente respecto al rectángulo
+  display.print("Hack");
+  display.drawRect(49, 25, 30, 15, SSD1306_WHITE);
+
+  // Ícono 3 (MStest)
+  display.setCursor(89, 40); // Centrado horizontalmente respecto al rectángulo
+  display.print("MStest");
+  display.drawRect(84, 25, 30, 15, SSD1306_WHITE);
+}
+
+void drawMouse() {
+  // Dibujar el cursor del mouse en la posición actual
+  display.fillRect(cursorX - 2, cursorY - 2, 4, 4, SSD1306_WHITE); // Cursor pequeño
+}
+
+void checkSelection() {
+  // Leer el estado del botón de selección
+  if (!inApp && digitalRead(selectButtonPin) == LOW) {
+    // Verificar en qué ícono está el cursor
+    if (cursorX >= 14 && cursorX <= 44 && cursorY >= 25 && cursorY <= 40) {
+      launchApp("Calc");
+    } else if (cursorX >= 49 && cursorX <= 79 && cursorY >= 25 && cursorY <= 40) {
+      launchApp("Hack");
+    } else if (cursorX >= 84 && cursorX <= 114 && cursorY >= 25 && cursorY <= 40) {
+      inApp = true; // Entramos a la app MStest
+      launchJoystickTest();
+    }
+  }
+}
+
+void launchApp(const String &appName) {
+  display.clearDisplay();
+  display.setTextSize(2);
+  display.setCursor(10, SCREEN_HEIGHT / 2 - 10);
+  display.print(appName);
+  display.display();
+  delay(2000); // Simular la carga de la app
+  setupIconsAndText(); // Volver al menú
+}
+
+void launchJoystickTest() {
+  while (true) {
+    // Leer joystick
+    joystickX = analogRead(A0);
+    joystickY = analogRead(A1);
+
+    // Mapear posición a valores en la pantalla
+    cursorX = map(joystickX, 0, 1023, 0, SCREEN_WIDTH - 1);
+    cursorY = map(joystickY, 0, 1023, 0, SCREEN_HEIGHT - 1);
+
+    // Mostrar un punto en la posición del mouse
+    display.clearDisplay();
+    display.fillCircle(cursorX, cursorY, 2, SSD1306_WHITE); // Mostrar punto del "mouse"
+
+    // Mostrar las coordenadas en la esquina superior izquierda
+    display.setTextSize(1);
+    display.setCursor(0, 0);
+    display.print("X: ");
+    display.print(cursorX);
+    display.print(" Y: ");
+    display.print(cursorY);
+
+    display.display();
+    delay(100);
+
+    // Salir al menú principal
+    if (digitalRead(exitButtonPin) == LOW) {
+      inApp = false;
+      display.clearDisplay();
+      setupIconsAndText();
+      display.display();
+      return;
+    }
+  }
+}
+
+void loop() {
+  if (!inApp) {
+    // Leer joystick
+    joystickX = analogRead(A0);
+    joystickY = analogRead(A1);
+
+    // Mapear joystick para controlar el movimiento del mouse
+    int deltaX = map(joystickX, 512, 1023, 0, 2) - map(joystickX, 0, 511, 2, 0); // Movimiento horizontal
+    int deltaY = map(joystickY, 512, 1023, 0, 2) - map(joystickY, 0, 511, 2, 0); // Movimiento vertical
+
+    // Actualizar posición del cursor
+    cursorX = constrain(cursorX + deltaX, 0, SCREEN_WIDTH - 1);
+    cursorY = constrain(cursorY + deltaY, 0, SCREEN_HEIGHT - 1);
+
+    // Redibujar íconos, texto y cursor
+    display.clearDisplay();
+    setupIconsAndText();
+    drawMouse();
+    display.display();
+
+    // Verificar selección
+    checkSelection();
+
+    delay(10); // Movimiento más fluido
+  }
+}

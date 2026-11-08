@@ -1,0 +1,77 @@
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <Arduino.h>
+
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET    -1
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// Variables para el joystick
+int joystickX = 0;
+int joystickY = 1;
+int cursorX = SCREEN_WIDTH / 2;
+int cursorY = SCREEN_HEIGHT / 2;
+bool buttonState = false;
+bool selectButtonState = false; // Nuevo botón para seleccionar la aplicación
+
+void setup() {
+  randomSeed(analogRead(0)); // Inicializar aleatoriedad
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    for (;;);
+  }
+  display.clearDisplay();
+
+  // Simulación de carga con tiempo aleatorio
+  int loadTime = random(1000, 10000); // Entre 1 y 10 segundos
+
+  // Mostrar texto de carga
+  display.setTextSize(2); // Tamaño grande para ArduinoOS
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor((SCREEN_WIDTH - 100) / 2, 5); // Subir más las letras
+  display.print("ArduinoOS");
+  display.setTextSize(1); // Tamaño pequeño para Created By
+  display.setCursor((SCREEN_WIDTH - 84) / 2, 25); // Subir más
+  display.print("Created By: ?????");
+
+  // Animar círculo de carga tipo Windows con un punto faltante
+  unsigned long startTime = millis();
+  while (millis() - startTime < loadTime) {
+    display.clearDisplay();
+    display.setTextSize(2);
+    display.setCursor((SCREEN_WIDTH - 100) / 2, 5);
+    display.print("ArduinoOS");
+    display.setTextSize(1);
+    display.setCursor((SCREEN_WIDTH - 84) / 2, 25);
+    display.print("Created By: ?????");
+    for (int i = 0; i < 7; i++) { // Solo 7 puntos para dejar un espacio vacío
+      int x = SCREEN_WIDTH / 2 + cos((i + millis() / 100) * PI / 4) * 8;
+      int y = 45 + sin((i + millis() / 100) * PI / 4) * 8; // Ajustar la posición del círculo más abajo
+      display.fillCircle(x, y, 2, SSD1306_WHITE);
+    }
+    display.display();
+    delay(100);
+  }
+
+  // Después de la carga, no mostrar nada en pantalla
+  display.clearDisplay();
+  display.display();
+}
+
+void loop() {
+  // Leer valores del joystick
+  joystickX = analogRead(A0); // Suponiendo que X está en A0
+  joystickY = analogRead(A1); // Suponiendo que Y está en A1
+
+  // Mapear los valores del joystick para que el puntero se mueva en la pantalla
+  cursorX = map(joystickX, 0, 1023, 0, SCREEN_WIDTH);  // Sin límite en el rango
+  cursorY = map(joystickY, 0, 1023, 0, SCREEN_HEIGHT); // Sin límite en el rango
+
+  // Mover el cursor
+  display.clearDisplay();
+  display.fillRect(cursorX - 5, cursorY - 5, 10, 10, SSD1306_WHITE); // Dibujar el puntero (rectángulo pequeño)
+
+  display.display();
+  delay(30); // Pausa pequeña para que el movimiento sea más fluido
+}
