@@ -1,0 +1,3683 @@
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <Preferences.h>
+#include <time.h>
+#include <sys/time.h>
+
+#define OLED_I2C_HZ 800000   // si la pantalla se ve con ruido, baja a 400000
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+
+// --- Pines ESP32 ---
+const uint8_t PIN_OK = 25;
+const uint8_t PIN_ESC = 26;
+const uint8_t PIN_3 = 14;
+const uint8_t PIN_4 = 12;
+const uint8_t PIN_STICK = 27;
+const uint8_t PIN_L = 32;
+const uint8_t PIN_R = 33;
+const uint8_t JOY_X = 34;
+const uint8_t JOY_Y = 35;
+
+int getJoyX() { return map(analogRead(JOY_X), 0, 4095, 0, 1023); }
+int getJoyY() { return map(analogRead(JOY_Y), 0, 4095, 0, 1023); }
+
+// --- Configuración Global ---
+float sensibilidad = 4.0;
+uint8_t brillo = 150;
+float cursorX = 64, cursorY = 32;
+int8_t currentApp = -1;
+int8_t selectedIcon = -1;
+bool isEnglish = false; 
+bool isLightTheme = false;
+
+uint8_t currentTab = 0;
+float scrollX = 0;
+float targetScrollX = 0;
+const float suavizado = 0.25;
+uint8_t showTabIndicator = 0;          
+unsigned long tabIndicatorTime = 0;
+const unsigned long indicatorDuration = 720;
+
+struct Btn {
+  uint8_t x, y, w, h;
+  char val;
+};
+
+// ====== Mortal Kombat: constantes y tipos ======
+#define MK_CW 27        // ancho de la mascara del sprite
+#define MK_CH 24        // alto del sprite
+#define MK_CX 13        // columna del centro del cuerpo dentro de la mascara
+#define MK_GROUND 60    // linea del piso
+#define MK_SY 36        // y de arriba del sprite cuando esta parado (pies en y=59)
+#define MK_PT 15        // y del portal superior
+
+// Poses de dibujo
+#define PO_IDLE 0
+#define PO_WALK 1
+#define PO_PUNCH 2
+#define PO_KICK 3
+#define PO_BLOCK 4
+#define PO_HIT 5
+#define PO_KO 6
+#define PO_WIN 7
+#define PO_CAST 8
+#define PO_FALL 9
+#define PO_AIRKICK 10
+
+// Acciones logicas
+#define MA_IDLE 0
+#define MA_WALK 1
+#define MA_PUNCH 2
+#define MA_KICK 3
+#define MA_BLOCK 4
+#define MA_HIT 5
+#define MA_KO 6
+#define MA_WIN 7
+#define MA_CAST 8
+#define MA_BUSY 9
+#define MA_CAPT 10
+
+struct MKFighter {
+  float x, y, hp, maxHp, spd;
+  uint8_t id, act, wf, ov;
+  int16_t t, cd;
+  bool right, hat, damaged, flip;
+};
+
+
+// Prototipos
+void bootSystem();
+void updateDesktop();
+void drawDesktop();
+void runFullCalc();
+void runAdvancedTimer();
+void flushScreen();
+void clockInit();
+void ntpKick();
+void alarmCheck();
+bool clockStatusText(char* b);
+bool alarmIsOn();
+uint8_t pickTwo(const char* title, const char* a, const char* b, uint8_t start = 0);
+void runSettings();
+void runProximamente();
+void runStickGraph();
+void runButtonTest();
+void runDesencriptador();
+void runIAApp();
+void runWifiManager();
+void runSnake();
+void runGames();
+void runDino();
+void runBreakout();
+void runFlappy();
+void runMortalKombat();
+bool gameOverScreen(uint16_t score, uint16_t best);
+
+void saveSys() {                                   // ajustes que sobreviven al apagado
+  Preferences sp;
+  sp.begin("sys", false);
+  sp.putUChar("br", brillo); sp.putFloat("sens", sensibilidad);
+  sp.putBool("en", isEnglish); sp.putBool("light", isLightTheme);
+  sp.end();
+}
+
+uint16_t loadBest(const char* k) {                  // record de cada juego
+  Preferences sp; sp.begin("scores", true);
+  uint16_t v = sp.getUShort(k, 0);
+  sp.end(); return v;
+}
+
+void saveBest(const char* k, uint16_t v) {          // solo escribe si mejora (cuida la flash)
+  if (v <= loadBest(k)) return;
+  Preferences sp; sp.begin("scores", false);
+  sp.putUShort(k, v); sp.end();
+}
+
+// Lista estilo app de reloj: titulo, pastillas redondeadas con el texto centrado y desplazamiento
+uint8_t menuStart(uint8_t sel, uint8_t n) {
+  if (n <= 4) return 0;
+  int st = (int)sel - 1; if (st < 0) st = 0; if (st > (int)n - 4) st = n - 4;
+  return (uint8_t)st;
+}
+
+void drawMenu(const char* title, const char* const* items, uint8_t n, uint8_t sel) {
+  display.clearDisplay(); display.setTextSize(1); display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0); display.print(title);
+  if (n > 4) {                                              // contador 3/8
+    char c[8]; snprintf(c, sizeof c, "%d/%d", sel + 1, n);
+    display.setCursor(128 - (int)strlen(c) * 6, 0); display.print(c);
+  }
+  uint8_t st = menuStart(sel, n);
+  for (uint8_t r = 0; r < 4 && st + r < n; r++) {
+    uint8_t i = st + r; int y = 13 + r * 12;
+    const char* t = items[i];
+    if (i == sel) { display.fillRoundRect(4, y, 116, 11, 3, SSD1306_WHITE); display.setTextColor(SSD1306_BLACK); }
+    else display.setTextColor(SSD1306_WHITE);
+    display.setCursor(62 - (int)strlen(t) * 3, y + 2); display.print(t);
+  }
+  display.setTextColor(SSD1306_WHITE);
+  if (st > 0) display.fillTriangle(124, 15, 121, 19, 127, 19, SSD1306_WHITE);                 // hay mas arriba
+  if (st + 4 < n) display.fillTriangle(121, 55, 127, 55, 124, 59, SSD1306_WHITE);             // hay mas abajo
+}
+
+// Pantalla de ajuste con barra (brillo, sensibilidad)
+void drawSlider(const char* title, const char* value, float frac) {
+  display.clearDisplay(); display.setTextSize(1); display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0); display.print(title);
+  display.setTextSize(2); display.setCursor(64 - (int)strlen(value) * 6, 18); display.print(value);
+  display.setTextSize(1);
+  if (frac < 0) { frac = 0; }
+  if (frac > 1) { frac = 1; }
+  display.drawRoundRect(12, 42, 104, 10, 3, SSD1306_WHITE);
+  display.fillRoundRect(14, 44, (int)(100 * frac), 6, 2, SSD1306_WHITE);
+  display.fillTriangle(4, 47, 8, 43, 8, 51, SSD1306_WHITE);
+  display.fillTriangle(124, 47, 120, 43, 120, 51, SSD1306_WHITE);
+}
+
+void saveWifi(const String& s, const String& p) {
+  Preferences prefs;
+  prefs.begin("wifi", false);
+  prefs.putString("ssid", s);
+  prefs.putString("pass", p);
+  prefs.end();
+}
+
+void setup() {
+  delay(300);
+  pinMode(PIN_OK, INPUT_PULLUP);
+  pinMode(PIN_ESC, INPUT_PULLUP);
+  pinMode(PIN_3, INPUT_PULLUP);
+  pinMode(PIN_4, INPUT_PULLUP);
+  pinMode(PIN_L, INPUT_PULLUP);
+  pinMode(PIN_R, INPUT_PULLUP);
+  pinMode(PIN_STICK, INPUT_PULLUP);
+
+  {
+    Preferences sp;
+    sp.begin("sys", true);
+    brillo = sp.getUChar("br", 150); sensibilidad = sp.getFloat("sens", 4.0);
+    isEnglish = sp.getBool("en", false); isLightTheme = sp.getBool("light", false);
+    sp.end();
+    if (brillo < 5) brillo = 5;
+    if (sensibilidad < 1 || sensibilidad > 10) sensibilidad = 4.0;
+  }
+  if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) for(;;) delay(1000);   // sin pantalla: espera sin bloquear el watchdog
+  Wire.setClock(OLED_I2C_HZ);
+
+  display.setTextWrap(false);
+  display.ssd1306_command(0x81);
+  display.ssd1306_command(brillo);
+  display.invertDisplay(isLightTheme);
+  
+  WiFi.persistent(false);                       // no regrabar la flash en cada conexion
+  WiFi.setAutoReconnect(true);
+  WiFi.mode(WIFI_STA);
+
+  {
+    Preferences prefs;
+    prefs.begin("wifi", true);
+    String s = prefs.getString("ssid", "");
+    String p = prefs.getString("pass", "");
+    prefs.end();
+    if (s.length()) WiFi.begin(s.c_str(), p.c_str());
+  }
+  clockInit();
+  bootSystem();
+}
+
+void loop() {
+  alarmCheck();
+  if (currentApp == -1) {
+    updateDesktop();
+    drawDesktop();
+  } else {
+    switch(currentApp) {
+      case 0: runFullCalc(); break;
+      case 1: runAdvancedTimer(); break;
+      case 2: runSettings(); break;
+      case 3: runGames(); break;
+      case 4: runDesencriptador(); break;
+      case 5: runIAApp(); break; 
+    }
+  }
+}
+
+void bootSystem() {
+  for(uint8_t frame = 0; frame < 10; frame++) {
+    display.clearDisplay();
+    display.setTextSize(2);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(5, 15);
+    display.print(F("Arduino OS"));
+    for(uint8_t i=0; i<8; i++) {
+      float angle = (frame * 0.5) + (i * 0.8);
+      display.fillCircle(64 + cos(angle)*10, 48 + sin(angle)*10, 1, SSD1306_WHITE);
+    }
+    flushScreen();
+    delay(100);
+  }
+}
+
+void updateDesktop() {
+  if (digitalRead(PIN_R) == LOW && currentTab < 1) {
+    currentTab = 1;
+    targetScrollX = -128;
+    showTabIndicator = 2;
+    tabIndicatorTime = millis();
+    delay(250);
+  }
+  if (digitalRead(PIN_L) == LOW && currentTab > 0) {
+    currentTab = 0;
+    targetScrollX = 0;
+    showTabIndicator = 1;
+    tabIndicatorTime = millis();
+    delay(250);
+  }
+
+  scrollX += (targetScrollX - scrollX) * suavizado;
+
+  int vx = getJoyX();
+  int vy = getJoyY();
+  
+  if(abs(vx - 512) > 50) {
+    if(vx < 400) cursorX += sensibilidad;      
+    else if(vx > 600) cursorX -= sensibilidad;  
+  }
+  if(abs(vy - 512) > 50) {
+    if(vy < 400) cursorY += sensibilidad;
+    else if(vy > 600) cursorY -= sensibilidad;
+  }
+  
+  cursorX = constrain(cursorX, 0, 120);
+  cursorY = constrain(cursorY, 0, 56);
+
+  selectedIcon = -1;
+  if (cursorY > 5 && cursorY < 40) {
+    if (currentTab == 0) {
+      if (cursorX < 42) selectedIcon = 0;
+      else if (cursorX < 84) selectedIcon = 1;
+      else selectedIcon = 2;
+    } else {
+      if (cursorX < 42) selectedIcon = 3;
+      else if (cursorX < 84) selectedIcon = 4;
+      else selectedIcon = 5; 
+    }
+  }
+
+  if (digitalRead(PIN_OK) == LOW && selectedIcon != -1) { currentApp = selectedIcon; delay(300); }
+}
+
+// Dibujo de cada icono (20x20, esquina ix,iy) en blanco sobre negro
+void drawAppIcon(uint8_t id, int ix, int iy) {
+  const uint16_t fg = SSD1306_WHITE, bg = SSD1306_BLACK;
+  int cx = ix + 10, cy = iy + 10;
+  switch (id) {
+    case 0:   // CALCULADORA: cuerpo, pantallita y teclas
+      display.drawRoundRect(ix + 2, iy, 16, 20, 2, fg);
+      display.fillRect(ix + 4, iy + 2, 12, 5, fg);
+      for (uint8_t r = 0; r < 3; r++) for (uint8_t c = 0; c < 3; c++) display.fillRect(ix + 5 + c * 4, iy + 10 + r * 3, 2, 2, fg);
+      break;
+    case 1:   // RELOJ despertador
+      display.fillCircle(ix + 3, iy + 3, 2, fg); display.fillCircle(ix + 17, iy + 3, 2, fg);
+      display.fillCircle(cx, cy + 1, 9, fg); display.fillCircle(cx, cy + 1, 7, bg);
+      display.drawLine(cx, cy + 1, cx, cy - 4, fg); display.drawLine(cx, cy + 1, cx + 3, cy + 3, fg);
+      display.drawPixel(cx, cy - 6, fg); display.drawPixel(cx, cy + 8, fg); display.drawPixel(cx - 6, cy + 1, fg); display.drawPixel(cx + 6, cy + 1, fg);
+      display.drawFastVLine(ix + 5, iy + 18, 2, fg); display.drawFastVLine(ix + 15, iy + 18, 2, fg);
+      break;
+    case 2:   // AJUSTES: engranaje
+      for (uint8_t k = 0; k < 8; k++) {
+        float a = k * 0.7854f;
+        display.fillCircle(cx + (int)lroundf(8 * cosf(a)), cy + (int)lroundf(8 * sinf(a)), 2, fg);
+      }
+      display.fillCircle(cx, cy, 7, fg); display.fillCircle(cx, cy, 3, bg);
+      break;
+    case 3:   // JUEGOS: control
+      display.fillRoundRect(ix + 1, iy + 5, 18, 11, 5, fg);
+      display.fillRect(ix + 3, iy + 3, 4, 3, fg); display.fillRect(ix + 13, iy + 3, 4, 3, fg);
+      display.drawFastHLine(ix + 3, iy + 10, 5, bg); display.drawFastVLine(ix + 5, iy + 8, 5, bg);
+      display.fillCircle(ix + 13, iy + 9, 1, bg); display.fillCircle(ix + 16, iy + 11, 1, bg);
+      display.fillRect(ix + 3, iy + 15, 3, 3, fg); display.fillRect(ix + 14, iy + 15, 3, 3, fg);
+      break;
+    case 4:   // CRIPTO: candado
+      display.drawRoundRect(ix + 5, iy + 1, 10, 12, 4, fg); display.drawRoundRect(ix + 6, iy + 2, 8, 10, 3, fg);
+      display.fillRoundRect(ix + 2, iy + 9, 16, 11, 2, fg);
+      display.fillCircle(cx, iy + 13, 2, bg); display.fillRect(cx - 1, iy + 14, 2, 4, bg);
+      break;
+    default:  // IA: robot
+      display.drawFastVLine(cx, iy + 1, 4, fg); display.fillCircle(cx, iy + 1, 1, fg);
+      display.fillRoundRect(ix + 2, iy + 5, 16, 14, 3, fg);
+      display.fillRect(ix, iy + 9, 2, 5, fg); display.fillRect(ix + 18, iy + 9, 2, 5, fg);
+      display.fillRect(ix + 5, iy + 9, 3, 3, bg); display.fillRect(ix + 12, iy + 9, 3, 3, bg);
+      display.drawFastHLine(ix + 6, iy + 15, 8, bg);
+      display.drawPixel(ix + 6, iy + 14, bg); display.drawPixel(ix + 13, iy + 14, bg);
+      break;
+  }
+}
+
+void drawDesktop() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  
+  int off0 = (int)scrollX;
+  int off1 = (int)scrollX + 128;
+
+  if(selectedIcon == 0) display.drawRect(8+off0, 8, 28, 28, SSD1306_WHITE);
+  drawAppIcon(0, 12 + off0, 12);
+  display.setCursor(10+off0, 39); display.print(F("Calc"));
+
+  if(selectedIcon == 1) display.drawRect(50+off0, 8, 28, 28, SSD1306_WHITE);
+  drawAppIcon(1, 54 + off0, 12);
+  display.setCursor(49+off0, 39); display.print(isEnglish ? F("Clock") : F("Reloj"));
+
+  if(selectedIcon == 2) display.drawRect(92+off0, 8, 28, 28, SSD1306_WHITE);
+  drawAppIcon(2, 96 + off0, 12);
+  display.setCursor(94+off0, 39); display.print(isEnglish ? F("Sett") : F("Conf"));
+
+  if(selectedIcon == 3) display.drawRect(8+off1, 8, 28, 28, SSD1306_WHITE);
+  drawAppIcon(3, 12 + off1, 12);
+  display.setCursor((isEnglish ? 7 : 4)+off1, 39); display.print(isEnglish ? F("Games") : F("Juegos"));
+
+  if(selectedIcon == 4) display.drawRect(50+off1, 8, 28, 28, SSD1306_WHITE); 
+  drawAppIcon(4, 54 + off1, 12);
+  display.setCursor(43+off1, 39); display.print(isEnglish ? F("Decrypt") : F("Descrip"));
+
+  if(selectedIcon == 5) display.drawRect(92+off1, 8, 28, 28, SSD1306_WHITE);
+  drawAppIcon(5, 96 + off1, 12);
+  display.setCursor(100+off1, 39); display.print(F("IA"));
+
+  if (showTabIndicator > 0) {
+    unsigned long elapsed = millis() - tabIndicatorTime;
+    if (elapsed < indicatorDuration) {
+      int indX = 54, indY = 48, indW = 20, indH = 14;
+      int density = 0; int textColor = SSD1306_BLACK;
+
+      if (elapsed < 60)       { density = 1; textColor = SSD1306_WHITE; }
+      else if (elapsed < 120) { density = 2; textColor = SSD1306_WHITE; }
+      else if (elapsed < 180) { density = 3; textColor = SSD1306_BLACK; }
+      else if (elapsed < 240) { density = 4; textColor = SSD1306_BLACK; }
+      else if (elapsed < 480) { density = 5; textColor = SSD1306_BLACK; }
+      else if (elapsed < 540) { density = 4; textColor = SSD1306_BLACK; }
+      else if (elapsed < 600) { density = 3; textColor = SSD1306_BLACK; }
+      else if (elapsed < 660) { density = 2; textColor = SSD1306_WHITE; }
+      else                    { density = 1; textColor = SSD1306_WHITE; }
+
+      if (density == 5) {
+        display.fillRoundRect(indX, indY, indW, indH, 2, SSD1306_WHITE);
+      } else {
+        for (int x = indX; x < indX + indW; x++) {
+          for (int y = indY; y < indY + indH; y++) {
+            if (density == 4 && !(x % 2 == 0 && y % 2 == 0)) display.drawPixel(x, y, SSD1306_WHITE);
+            if (density == 3 && (x + y) % 2 == 0) display.drawPixel(x, y, SSD1306_WHITE);
+            if (density == 2 && x % 2 == 0 && y % 2 == 0) display.drawPixel(x, y, SSD1306_WHITE);
+            if (density == 1 && (x + y) % 4 == 0) display.drawPixel(x, y, SSD1306_WHITE);
+          }
+        }
+      }
+      display.setTextColor(textColor); display.setCursor(61, indY + 3);
+      display.print(showTabIndicator); display.setTextColor(SSD1306_WHITE);
+    } else { showTabIndicator = 0; }
+  }
+  
+  display.fillTriangle(cursorX, cursorY, cursorX, cursorY+7, cursorX+5, cursorY+5, SSD1306_WHITE);
+  flushScreen();
+}
+
+// ===================== SETTINGS =====================
+void runSettings() {
+  int subMenu = 0;
+  delay(200);
+  while(digitalRead(PIN_ESC) == HIGH) {
+    const char* itES[8] = {"Especificaciones", "Prueba stick", "Prueba boton", "Sensibilidad", "Brillo", "Idioma", "Tema", "Wi-Fi"};
+    const char* itEN[8] = {"Specifications", "Stick test", "Button test", "Sensitivity", "Brightness", "Language", "Theme", "Wi-Fi"};
+    drawMenu(isEnglish ? "SETTINGS" : "CONFIGURACION", isEnglish ? itEN : itES, 8, subMenu);
+    flushScreen();
+
+    int vy = getJoyY();
+    if(vy < 300) { subMenu++; if(subMenu > 7) subMenu = 0; delay(170); } 
+    if(vy > 700) { subMenu--; if(subMenu < 0) subMenu = 7; delay(170); } 
+    
+    if(digitalRead(PIN_OK) == LOW) {
+      delay(250);
+      if(subMenu == 0) {
+        float scrollY = 0; float targetScrollY = 0;
+        const uint8_t totalLines = 23;
+        const uint8_t lineSpacing = 10;
+        const int maxScroll = totalLines * lineSpacing - 50;
+        const __FlashStringHelper* lines[totalLines] = {
+          F("[SYSTEM]"), F("OS: Arduino OS 0.16R.1"), F("HW: ESP32 WROOM-32"), F("CPU Clock: 240 MHz"), F("RAM: 520 KB"), F("Storage: 4MB Flash"), F(""),
+          F("[DISPLAY]"), F("Type: OLED Monocromo"), F("Driver: SSD1306"), F("Res: 128x64 Pixels"), F(""),
+          F("[VERSION LEGEND]"), F("B: BUG UPDATE"), F("R: REDESIGN"), F("U: UPDATE"), F("MU: MEGA UPDATE"), F("G: GAME UPDATE"), F(""),
+          F("[MADE BY]"), F("Mathias Bracho"), F("Daniel Vilchez"), F("Javier Mora")      
+        };
+        while(digitalRead(PIN_ESC) == HIGH) {
+          display.clearDisplay();
+          int sVy = getJoyY();
+          if(sVy < 300) targetScrollY += 3.5;
+          if(sVy > 700) targetScrollY -= 3.5;
+          targetScrollY = constrain(targetScrollY, 0, maxScroll);
+          scrollY += (targetScrollY - scrollY) * 0.30;
+          for(uint8_t i = 0; i < totalLines; i++) {
+            int yPos = 12 + (i * lineSpacing) - (int)scrollY;
+            if(yPos > -8 && yPos < 64) { display.setCursor(0, yPos); display.println(lines[i]); }
+          }
+          display.fillRect(0, 0, 128, 11, SSD1306_BLACK);
+          display.setCursor(isEnglish ? 22 : 16, 0);
+          display.println(isEnglish ? F("SPECIFICATIONS") : F("ESPECIFICACIONES"));
+          display.drawLine(0, 9, 128, 9, SSD1306_WHITE);
+          int barHeight = 12;
+          int barY = 12 + map((int)scrollY, 0, maxScroll, 0, 50 - barHeight);
+          display.drawFastVLine(126, 12, 50, SSD1306_WHITE);
+          display.fillRect(125, barY, 3, barHeight, SSD1306_WHITE);
+          flushScreen(); delay(15);
+        }
+        delay(250);
+      } 
+      else if(subMenu == 1) { runStickGraph(); delay(250); } 
+      else if(subMenu == 2) { runButtonTest(); delay(250); } 
+      else if(subMenu == 3) {
+        while(digitalRead(PIN_ESC) == HIGH) {
+          int valX = getJoyX(); if(valX < 300) sensibilidad += 0.5; if(valX > 700) sensibilidad -= 0.5;
+          sensibilidad = constrain(sensibilidad, 1, 10);
+          char vb[10]; snprintf(vb, sizeof vb, "%.1f", sensibilidad);
+          drawSlider(isEnglish ? "SENSITIVITY" : "SENSIBILIDAD", vb, (sensibilidad - 1) / 9.0f);
+          flushScreen(); delay(40);
+        }
+        saveSys(); delay(250);
+      } 
+      else if(subMenu == 4) {
+        while(digitalRead(PIN_ESC) == HIGH) {
+          int valX = getJoyX(); int nb = brillo; if(valX < 300) nb += 15; if(valX > 700) nb -= 15;
+          brillo = constrain(nb, 5, 255);   // calculado en int: evita el desbordamiento de uint8_t
+          display.ssd1306_command(0x81); display.ssd1306_command(brillo);
+          char vb[10]; snprintf(vb, sizeof vb, "%d%%", (int)((brillo - 5) * 100 / 250));
+          drawSlider(isEnglish ? "BRIGHTNESS" : "BRILLO", vb, (brillo - 5) / 250.0f);
+          flushScreen(); delay(40);
+        }
+        saveSys(); delay(250);
+      } 
+      else if(subMenu == 5) {
+        uint8_t r = pickTwo(isEnglish ? "LANGUAGE" : "IDIOMA", "Espanol", "English", isEnglish ? 1 : 0);
+        if(r != 255) { isEnglish = (r == 1); saveSys(); }
+        delay(250);
+      } 
+      else if(subMenu == 6) {
+        uint8_t r = pickTwo(isEnglish ? "THEME" : "TEMA", isEnglish ? "Dark" : "Oscuro", isEnglish ? "Light" : "Claro", isLightTheme ? 1 : 0);
+        if(r != 255) { isLightTheme = (r == 1); display.invertDisplay(isLightTheme); saveSys(); }
+        delay(250);
+      } 
+      else if(subMenu == 7) {
+        runWifiManager();
+        delay(250);
+      }
+    }
+    flushScreen();
+    delay(20);
+  }
+  currentApp = -1; delay(300);
+}
+
+// ===================== WIFI =====================
+// Intenta conectar con animacion; el boton 2 cancela. true si conecto.
+bool wifiTry(const char* ssid, const char* pass) {
+  WiFi.disconnect(false);
+  delay(50);
+  if (pass && pass[0]) WiFi.begin(ssid, pass); else WiFi.begin(ssid);
+  unsigned long t0 = millis(); uint8_t dots = 0;
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 12000) {
+    if (digitalRead(PIN_ESC) == LOW) { WiFi.disconnect(false); while (digitalRead(PIN_ESC) == LOW) delay(10); delay(150); return false; }
+    display.clearDisplay(); display.setTextSize(1); display.setTextColor(SSD1306_WHITE);
+    display.setCursor(isEnglish ? 28 : 22, 24); display.print(isEnglish ? F("CONNECTING") : F("CONECTANDO"));
+    for (uint8_t i = 0; i < (dots % 4); i++) display.print('.');
+    display.setCursor(isEnglish ? 16 : 22, 48); display.print(isEnglish ? F("2: cancel") : F("2: cancelar"));
+    flushScreen(); delay(250); dots++;
+  }
+  bool ok = (WiFi.status() == WL_CONNECTED);
+  if (ok) { saveWifi(String(ssid), String(pass ? pass : "")); ntpKick(); }
+  display.clearDisplay(); display.setTextSize(1);
+  const char* m = ok ? (isEnglish ? "CONNECTED!" : "CONECTADO!") : (isEnglish ? "FAILED" : "ERROR");
+  display.setCursor(64 - strlen(m) * 3, 28); display.print(m);
+  flushScreen(); delay(1500);
+  return ok;
+}
+
+void runWifiManager() {
+  display.clearDisplay();
+  display.setCursor(10, 25);
+  display.print(isEnglish ? F("SCANNING...") : F("BUSCANDO REDES..."));
+  flushScreen();
+
+  int n = WiFi.scanNetworks();
+  int sel = 0;
+  
+  if (n <= 0) {                                   // 0 = nada, negativo = fallo del escaneo
+    WiFi.scanDelete();
+    while(digitalRead(PIN_ESC) == HIGH) {
+      display.clearDisplay(); display.setCursor(10, 25);
+      display.print(isEnglish ? F("NO NETWORKS FOUND") : F("NO HAY REDES")); flushScreen(); delay(30);
+    }
+    delay(300);
+    return;
+  }
+
+  while(digitalRead(PIN_ESC) == HIGH) {
+    display.clearDisplay();
+    display.setCursor(0,0); display.print(isEnglish ? F("SELECT WIFI:") : F("SELECCIONAR WIFI:"));
+    display.drawLine(0, 9, 128, 9, SSD1306_WHITE);
+    
+    uint8_t st = menuStart(sel, n > 250 ? 250 : n);
+    if (n > 4) {
+      char c[10]; snprintf(c, sizeof c, "%d/%d", sel + 1, n);
+      display.setCursor(128 - (int)strlen(c) * 6, 0); display.print(c);
+    }
+    for (uint8_t r = 0; r < 4 && st + r < n; r++) {
+      int idx = st + r, y = 13 + r * 12;
+      bool on = (idx == sel);
+      uint16_t fg = on ? SSD1306_BLACK : SSD1306_WHITE;
+      if (on) display.fillRoundRect(4, y, 116, 11, 3, SSD1306_WHITE);
+      display.setTextColor(fg);
+      String nm = WiFi.SSID(idx).substring(0, 13);
+      display.setCursor(62 - (int)nm.length() * 3, y + 2); display.print(nm);
+      if (WiFi.encryptionType(idx) != WIFI_AUTH_OPEN) {                       // candado
+        display.drawRect(8, y + 5, 5, 4, fg); display.drawPixel(10, y + 3, fg); display.drawFastHLine(9, y + 3, 3, fg);
+      }
+      int rs = WiFi.RSSI(idx); uint8_t bars = rs > -55 ? 3 : (rs > -70 ? 2 : 1);   // senal
+      for (uint8_t b = 0; b < 3; b++) { if (b < bars) display.fillRect(105 + b * 4, y + 8 - b * 2 - 1, 3, b * 2 + 2, fg); }
+      display.setTextColor(SSD1306_WHITE);
+    }
+    if (st > 0) display.fillTriangle(124, 15, 121, 19, 127, 19, SSD1306_WHITE);
+    if (st + 4 < n) display.fillTriangle(121, 55, 127, 55, 124, 59, SSD1306_WHITE);
+    flushScreen();
+    
+    int vy = getJoyY(); 
+    if(vy < 300 && sel < n-1) { sel++; delay(200); }
+    if(vy > 700 && sel > 0) { sel--; delay(200); }
+    
+    if(digitalRead(PIN_OK) == LOW) {
+      delay(300);
+      if (WiFi.encryptionType(sel) == WIFI_AUTH_OPEN) {
+        String ss = WiFi.SSID(sel);
+        WiFi.scanDelete();
+        wifiTry(ss.c_str(), "");
+        return;
+      } else break; 
+    }
+  }
+  
+  if (digitalRead(PIN_ESC) == LOW) { WiFi.scanDelete(); delay(300); return; }
+
+  char passInput[64] = "";
+  int kx = 0, ky = 0;
+  bool isNumeric = false;
+  
+  static const char kb[30] PROGMEM = {
+    'A','B','C','D','E','F','G','H','I','J','K','L',
+    'M','N','~','O','P','Q','R','S','T','U','V','W',
+    'X','Y','Z','_','<','='
+  };
+  
+  static const char numPad[15] PROGMEM = {
+    '1','2','3','4','5','6','7','8','9','0','_','<','=',' ',' '
+  };
+
+  while(digitalRead(PIN_ESC) == HIGH) {
+    display.clearDisplay();
+    display.setCursor(0,0); 
+    display.print(isEnglish ? F("NET: ") : F("RED: ")); display.print(WiFi.SSID(sel).substring(0, 10));
+    display.setCursor(0, 10);
+    display.print(F("PASS: ")); { uint8_t pl = strlen(passInput); display.print(pl > 15 ? &passInput[pl - 15] : passInput); }
+    display.drawLine(0, 20, 128, 20, SSD1306_WHITE);
+
+    if(!isNumeric) {
+      for(uint8_t y=0; y<5; y++) {
+        for(uint8_t x=0; x<6; x++) {
+          int px = 5 + (x * 20);
+          int py = 23 + (y * 8); 
+          char c = pgm_read_byte(&kb[y*6 + x]); 
+          if(kx == x && ky == y) {
+            display.fillRect(px-2, py-1, 10, 9, SSD1306_WHITE);
+            display.setTextColor(SSD1306_BLACK);
+          } else display.setTextColor(SSD1306_WHITE);
+          display.setCursor(px, py);
+          if(c == '~') display.print(char(164));
+          else if(c == '_') display.print(F(" ")); 
+          else display.print(c);
+        }
+      }
+    } else {
+      for(uint8_t y=0; y<3; y++) {
+        for(uint8_t x=0; x<5; x++) {
+          if(y==2 && x>2) continue; 
+          int px = 10 + (x * 22);
+          int py = 25 + (y * 12);
+          char c = pgm_read_byte(&numPad[y*5 + x]); 
+          if(kx == x && ky == y) {
+            display.fillRect(px-2, py-1, 14, 10, SSD1306_WHITE);
+            display.setTextColor(SSD1306_BLACK);
+          } else display.setTextColor(SSD1306_WHITE);
+          display.setCursor(px, py);
+          if(c == '_') display.print(F("SPC"));
+          else if(c == '<') display.print(F("DEL"));
+          else if(c == '=') display.print(F("OK"));
+          else display.print(c);
+        }
+      }
+    }
+    display.setTextColor(SSD1306_WHITE);
+
+    int vx = getJoyX(); int vy = getJoyY();
+    if(!isNumeric) {
+      if(vx < 300) { kx++; if(kx>5) kx=0; delay(150); }
+      if(vx > 700) { kx--; if(kx<0) kx=5; delay(150); }
+      if(vy < 300) { ky++; if(ky>4) ky=0; delay(150); }
+      if(vy > 700) { ky--; if(ky<0) ky=4; delay(150); }
+    } else {
+      if(vx < 300) { kx++; if(kx>4) kx=0; delay(150); }
+      if(vx > 700) { kx--; if(kx<0) kx=4; delay(150); }
+      if(vy < 300) { ky++; if(ky>2) ky=0; delay(150); }
+      if(vy > 700) { ky--; if(ky<0) ky=2; delay(150); }
+    }
+
+    if(digitalRead(PIN_4) == LOW) {
+      isNumeric = !isNumeric;
+      kx = 0; ky = 0; 
+      delay(250);
+    }
+
+    if(digitalRead(PIN_OK) == LOW) {
+      char selected = isNumeric ? pgm_read_byte(&numPad[ky*5 + kx]) : pgm_read_byte(&kb[ky*6 + kx]);
+      if(selected == '<') {
+        uint8_t len = strlen(passInput);
+        if(len > 0) passInput[len-1] = '\0';
+      } else if(selected != '=' && selected != ' ') {
+        uint8_t len = strlen(passInput);
+        if(len < 62) {
+          passInput[len] = (selected == '~') ? char(164) : selected;
+          passInput[len+1] = '\0';
+        }
+      }
+      delay(200);
+    }
+
+    if(digitalRead(PIN_3) == LOW) {
+      String ss = WiFi.SSID(sel);
+      wifiTry(ss.c_str(), passInput);
+      break;
+    }
+  }
+  WiFi.scanDelete();
+  delay(300);
+}
+
+void runStickGraph() {
+  while(digitalRead(PIN_ESC) == HIGH) {
+    int rx = getJoyX(); int ry = getJoyY();
+    int gX = map(rx, 0, 1023, 118, 10);
+    int gY = map(ry, 0, 1023, 54, 10);
+    display.clearDisplay();
+    display.drawRect(0, 0, 128, 64, SSD1306_WHITE);
+    display.setCursor(4, 4); display.print(F("STICK ANALYZER"));
+    display.drawLine(64, 10, 64, 54, SSD1306_WHITE);
+    display.drawLine(10, 32, 118, 32, SSD1306_WHITE);
+    display.drawCircle(gX, gY, 5, SSD1306_WHITE);
+    display.setCursor(4, 55); display.print(F("X:")); display.print(rx);
+    display.setCursor(70, 55); display.print(F("Y:")); display.print(ry);
+    flushScreen();
+    delay(20);
+  }
+}
+
+void runButtonTest() {
+  char history[5] = {' ', ' ', ' ', ' ', ' '};
+  unsigned long lastClick2Time = 0;
+  unsigned long debounceTime = 0;
+  
+  while(true) {
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setCursor(2, 53);
+    display.print(isEnglish ? F("Press x2 ") : F("Pulsa x2 "));
+    int textOffset = isEnglish ? 56 : 60;
+    display.drawCircle(textOffset + 5, 56, 6, SSD1306_WHITE);
+    display.setCursor(textOffset + 3, 53);
+    display.print(F("2")); 
+    display.setCursor(textOffset + 14, 53);
+    display.print(isEnglish ? F(" to exit") : F(" p/ salir"));
+    
+    bool p1 = (digitalRead(PIN_OK) == LOW);
+    bool p2 = (digitalRead(PIN_ESC) == LOW);
+    bool p3 = (digitalRead(PIN_3) == LOW); 
+    bool p4 = (digitalRead(PIN_4) == LOW);
+    bool pL = (digitalRead(PIN_L) == LOW); 
+    bool pR = (digitalRead(PIN_R) == LOW); 
+    bool pS = (digitalRead(PIN_STICK) == LOW);
+    char pressedBtn = ' ';
+    
+    if (millis() - debounceTime > 200) {
+      if (p1) pressedBtn = '1';
+      else if (p3) pressedBtn = '3'; 
+      else if (p4) pressedBtn = '4'; 
+      else if (pL) pressedBtn = 'L';
+      else if (pR) pressedBtn = 'R';
+      else if (pS) pressedBtn = 'S';
+      else if (p2) {
+         if (millis() - lastClick2Time < 400) break;
+         else { pressedBtn = '2'; lastClick2Time = millis(); }
+      }
+      if (pressedBtn != ' ') {
+        for (int i = 0; i < 4; i++) history[i] = history[i+1];
+        history[4] = pressedBtn; 
+        debounceTime = millis();
+      }
+    }
+    
+    for (int i = 0; i < 5; i++) {
+      int cx = 16 + (i * 24);
+      int cy = 25; 
+      if (history[i] != ' ') {
+        display.drawCircle(cx, cy, 11, SSD1306_WHITE);
+        display.setCursor(cx - 2, cy - 3);
+        display.print(history[i]);
+      } else display.drawPixel(cx, cy, SSD1306_WHITE);
+    }
+    flushScreen();
+  }
+}
+
+// ===================== DESENCRIPTADOR =====================
+void runDesencriptador() {
+  uint8_t step = 0;
+  uint8_t subMenu = 0;
+  char inputStr[64] = "";   
+  char outputStr[96] = "";  
+  char currentNumStr[6] = "";
+  int kx = 0, ky = 0; 
+  
+  static const char kb[30] PROGMEM = {
+    'A','B','C','D','E','F','G','H','I','J','K','L',
+    'M','N','~','O','P','Q','R','S','T','U','V','W',
+    'X','Y','Z','_','<','='
+  };
+  static const char numPad[15] PROGMEM = {
+    '1','2','3','4','5','6','7','8','9','0','_','<','=',' ',' '
+  };
+
+  while(digitalRead(PIN_ESC) == HIGH) {
+    display.clearDisplay();
+    
+    if (step == 0) {
+      const char* it0[1] = { isEnglish ? "Numeric" : "Numerico" };
+      drawMenu(isEnglish ? "DECRYPTOR" : "DESENCRIPTADOR", it0, 1, 0);
+      if(digitalRead(PIN_OK) == LOW) { step = 1; delay(300); }
+    }
+    else if (step == 1) {
+      const char* it1[2] = { isEnglish ? "Encrypt" : "Encriptar", isEnglish ? "Decrypt" : "Desencriptar" };
+      drawMenu(isEnglish ? "NUMERIC" : "NUMERICO", it1, 2, subMenu);
+      int vy = getJoyY();
+      if(vy < 300) { subMenu = 1; delay(200); }
+      if(vy > 700) { subMenu = 0; delay(200); }
+      if(digitalRead(PIN_OK) == LOW) {
+        step = (subMenu == 0) ? 2 : 3;
+        inputStr[0] = outputStr[0] = currentNumStr[0] = '\0';
+        kx = ky = 0;
+        delay(300);
+      }
+    }
+    else if (step == 2) {
+      display.setCursor(0, 0);
+      uint8_t inLen = strlen(inputStr);
+      if(inLen > 21) display.print(&inputStr[inLen-21]);
+      else display.print(inputStr);
+      display.drawLine(0, 10, 128, 10, SSD1306_WHITE);
+      for(uint8_t y=0; y<5; y++) {
+        for(uint8_t x=0; x<6; x++) {
+          int px = 5 + (x * 20);
+          int py = 14 + (y * 10);
+          char c = pgm_read_byte(&kb[y*6 + x]);
+          if(kx == x && ky == y) {
+            display.fillRect(px-2, py-1, 10, 9, SSD1306_WHITE);
+            display.setTextColor(SSD1306_BLACK);
+          } else display.setTextColor(SSD1306_WHITE);
+          display.setCursor(px, py);
+          if(c == '~') display.print(char(164));
+          else if(c == '_') display.print(F(" "));
+          else display.print(c);
+        }
+      }
+      display.setTextColor(SSD1306_WHITE);
+      int vx = getJoyX(), vy = getJoyY();
+      if(vx < 300) { kx++; if(kx>5) kx=0; delay(150); }
+      if(vx > 700) { kx--; if(kx<0) kx=5; delay(150); }
+      if(vy < 300) { ky++; if(ky>4) ky=0; delay(150); }
+      if(vy > 700) { ky--; if(ky<0) ky=4; delay(150); }
+      if(digitalRead(PIN_OK) == LOW) {
+        char selected = pgm_read_byte(&kb[ky*6 + kx]);
+        if(selected == '<') {                       // borrar solo la ultima letra
+          uint8_t il = strlen(inputStr); if(il > 0) inputStr[il-1] = '\0';
+          int ol = strlen(outputStr);
+          if(ol > 0) { ol--; while(ol > 0 && outputStr[ol-1] != ' ') ol--; outputStr[ol] = '\0'; }
+        }
+        else if(selected == '=') step = 4;
+        else {
+          uint8_t currentLen = strlen(inputStr);
+          if(currentLen < 62) {
+            inputStr[currentLen] = (selected == '~') ? char(164) : (selected == '_' ? ' ' : selected);
+            inputStr[currentLen+1] = '\0';
+          }
+          int val = 0;
+          if(selected == '_') val = 0;
+          else if(selected >= 'A' && selected <= 'N') val = selected - 'A' + 1;
+          else if(selected == '~') val = 15;
+          else if(selected >= 'O' && selected <= 'Z') val = selected - 'A' + 2;
+          char tmp[6];
+          itoa(val, tmp, 10);
+          if(strlen(outputStr) + strlen(tmp) + 1 < 94) {
+            strcat(outputStr, tmp);
+            strcat(outputStr, " ");
+          }
+        }
+        delay(250);
+      }
+    }
+    else if (step == 3) {
+      display.setCursor(0, 0);
+      display.print(F("Res: "));
+      uint8_t outLen = strlen(outputStr);
+      if(outLen > 16) display.print(&outputStr[outLen-16]);
+      else display.print(outputStr);
+      display.setCursor(0, 10);
+      display.print(F("Num: "));
+      display.print(currentNumStr);
+      display.drawLine(0, 20, 128, 20, SSD1306_WHITE);
+      for(uint8_t y=0; y<3; y++) {
+        for(uint8_t x=0; x<5; x++) {
+          if(y==2 && x>2) continue;
+          int px = 10 + (x * 22);
+          int py = 25 + (y * 12);
+          char c = pgm_read_byte(&numPad[y*5 + x]);
+          if(kx == x && ky == y) {
+            display.fillRect(px-2, py-1, 14, 10, SSD1306_WHITE);
+            display.setTextColor(SSD1306_BLACK);
+          } else display.setTextColor(SSD1306_WHITE);
+          display.setCursor(px, py);
+          if(c == '_') display.print(F("NXT"));
+          else if(c == '<') display.print(F("RST"));
+          else if(c == '=') display.print(F("OK"));
+          else display.print(c);
+        }
+      }
+      display.setTextColor(SSD1306_WHITE);
+      int vx = getJoyX(), vy = getJoyY();
+      if(vx < 300) { kx++; if(kx>4) kx=0; delay(150); }
+      if(vx > 700) { kx--; if(kx<0) kx=4; delay(150); }
+      if(vy < 300) { ky++; if(ky>2) ky=0; delay(150); }
+      if(vy > 700) { ky--; if(ky<0) ky=2; delay(150); }
+      if(digitalRead(PIN_OK) == LOW) {
+        char selected = pgm_read_byte(&numPad[ky*5 + kx]);
+        if(selected >= '0' && selected <= '9') {
+          uint8_t len = strlen(currentNumStr);
+          if(len < 5) {
+            currentNumStr[len] = selected;
+            currentNumStr[len+1] = '\0';
+          }
+        } else if(selected == '<') {
+          outputStr[0] = currentNumStr[0] = '\0';
+        } else if(selected == '_') {
+          int val = atoi(currentNumStr);
+          char resChar = '?';
+          if(val == 0) resChar = ' ';
+          else if(val >= 1 && val <= 14) resChar = 'A' + val - 1;
+          else if(val == 15) resChar = char(164);
+          else if(val >= 16 && val <= 27) resChar = 'A' + val - 2;
+          uint8_t currentOutLen = strlen(outputStr);
+          if(currentOutLen < 94) {
+            outputStr[currentOutLen] = resChar;
+            outputStr[currentOutLen+1] = '\0';
+          }
+          currentNumStr[0] = '\0';
+        } else if(selected == '=') step = 5;
+        delay(250);
+      }
+    }
+    else if (step == 4 || step == 5) {
+      display.setCursor(0, 0);
+      display.print(isEnglish ? F("FINAL RESULT:") : F("RESULTADO FINAL:"));
+      display.drawLine(0, 10, 128, 10, SSD1306_WHITE);
+      display.setTextWrap(true);
+      display.setCursor(0, 15);
+      display.print(outputStr);
+      display.setTextWrap(false);
+      display.fillRect(0, 54, 128, 10, SSD1306_WHITE);
+      display.setTextColor(SSD1306_BLACK);
+      display.setCursor(isEnglish ? 35 : 25, 55);
+      display.print(isEnglish ? F("OK TO EXIT") : F("OK PARA SALIR"));
+      display.setTextColor(SSD1306_WHITE);
+      if(digitalRead(PIN_OK) == LOW) break;
+    }
+    flushScreen();
+  }
+  currentApp = -1; delay(300);
+}
+
+// ===================== IA =====================
+void runIAApp() {
+  if (WiFi.status() != WL_CONNECTED) {
+    while(digitalRead(PIN_ESC) == HIGH) {
+      display.clearDisplay();
+      display.setCursor(15, 25);
+      display.print(isEnglish ? F("CONNECT TO WIFI") : F("CONECTATE A WIFI"));
+      flushScreen();
+    }
+    currentApp = -1; delay(300);
+    return;
+  }
+
+  char inputStr[32] = "";
+  uint8_t step = 0;
+  int kx = 0, ky = 0;
+  String respuestaIA = "";
+
+  while(digitalRead(PIN_ESC) == HIGH) {
+    display.clearDisplay();
+    if(step == 0) {
+      display.setCursor(0, 0);
+      display.print(F("Ask: "));
+      display.print(inputStr);
+      display.drawLine(0, 10, 128, 10, SSD1306_WHITE);
+
+      static const char kb[30] PROGMEM = {
+        'A','B','C','D','E','F','G','H','I','J','K','L',
+        'M','N','O','P','Q','R','S','T','U','V','W','X',
+        'Y','Z','_','<','=',' '
+      };
+
+      for(uint8_t y=0; y<5; y++) {
+        for(uint8_t x=0; x<6; x++) {
+          int px = 5 + (x * 20);
+          int py = 14 + (y * 9);
+          char c = pgm_read_byte(&kb[y*6 + x]);
+          if(kx == x && ky == y) {
+            display.fillRect(px-2, py-1, 10, 9, SSD1306_WHITE);
+            display.setTextColor(SSD1306_BLACK);
+          } else display.setTextColor(SSD1306_WHITE);
+          display.setCursor(px, py);
+          if(c == '_') display.print(F(" "));
+          else if(c == '<') display.print(F("<"));
+          else if(c == '=') display.print(F("="));
+          else display.print(c);
+        }
+      }
+      display.setTextColor(SSD1306_WHITE);
+
+      int vx = getJoyX(), vy = getJoyY();
+      if(vx < 300) { kx++; if(kx>5) kx=0; delay(150); }
+      if(vx > 700) { kx--; if(kx<0) kx=5; delay(150); }
+      if(vy < 300) { ky++; if(ky>4) ky=0; delay(150); }
+      if(vy > 700) { ky--; if(ky<0) ky=4; delay(150); }
+
+      if(digitalRead(PIN_OK) == LOW) {
+        char selected = pgm_read_byte(&kb[ky*6 + kx]);
+        if(selected == '<') {
+          uint8_t len = strlen(inputStr);
+          if(len > 0) inputStr[len-1] = '\0';
+        } else if(selected != '=') {
+          uint8_t len = strlen(inputStr);
+          if(len < 30) {
+            inputStr[len] = (selected == '_') ? ' ' : selected;
+            inputStr[len+1] = '\0';
+          }
+        }
+        delay(200);
+      }
+
+      if(digitalRead(PIN_3) == LOW || (digitalRead(PIN_OK) == LOW && pgm_read_byte(&kb[ky*6 + kx]) == '=')) {
+        display.clearDisplay();
+        display.setCursor(0, 25);
+        display.print(F("BUSCANDO EN LA RED..."));
+        flushScreen();
+
+        WiFiClientSecure client;
+        client.setInsecure();
+        HTTPClient http;
+        String query = String(inputStr);
+        query.replace(" ", "+");
+        String url = "https://api.duckduckgo.com/?q=" + query + "&format=json&no_html=1";
+        http.setTimeout(8000);
+        http.setConnectTimeout(5000);
+        http.begin(client, url);
+        int httpCode = (WiFi.status() == WL_CONNECTED) ? http.GET() : -1;
+
+        if(httpCode == 200 || httpCode == 202) {
+          String payload = http.getString();
+          StaticJsonDocument<48> filter;               // solo se lee AbstractText (el JSON completo es enorme)
+          filter["AbstractText"] = true;
+          DynamicJsonDocument doc(2048);
+          DeserializationError jerr = deserializeJson(doc, payload, DeserializationOption::Filter(filter));
+          String text = jerr ? String("") : doc["AbstractText"].as<String>();
+          if(jerr) {
+            respuestaIA = "Error leyendo la respuesta.";
+          } else if(text.length() == 0 || text == "null") {
+            respuestaIA = "WAF! No hay datos para eso.";
+          } else respuestaIA = text;
+        } else {
+          respuestaIA = (httpCode < 0) ? String("Sin conexion Wi-Fi.") : ("Error de Red: " + String(httpCode));
+        }
+        http.end();
+        step = 1;
+        delay(300);
+      }
+    }
+    else if(step == 1) {
+      display.setCursor(0, 0);
+      display.print(F("PERRO IA RESPONDE:"));
+      display.drawLine(0, 10, 128, 10, SSD1306_WHITE);
+      display.setTextWrap(true);
+      display.setCursor(0, 15);
+      display.print(respuestaIA.substring(0, 105));
+      display.setTextWrap(false);
+      display.setCursor(0, 56);
+      display.print(F("B4: OTRA CONSULTA"));
+      if(digitalRead(PIN_4) == LOW) {
+        inputStr[0] = '\0';
+        step = 0;
+        delay(300);
+      }
+    }
+    flushScreen();
+  }
+  currentApp = -1; delay(300);
+}
+
+// ===================== SNAKE =====================
+void runSnake() {
+  const uint8_t GW = 30, GH = 12, CELL = 4;
+  const uint8_t OX = 4, OY = 14;
+  static uint8_t sx[360], sy[360];
+  static uint16_t best = 0; static bool bestLd = false;
+  if (!bestLd) { best = loadBest("snake"); bestLd = true; }
+  const int8_t dx[4] = {1, 0, -1, 0};
+  const int8_t dy[4] = {0, 1, 0, -1};
+
+  randomSeed(micros());
+  delay(300);
+
+  bool exitGame = false;
+  while (!exitGame) {
+    uint16_t len = 3;
+    uint8_t dir = 0, nextDir = 0;
+    for (uint8_t i = 0; i < len; i++) {
+      sx[i] = 5 - i;
+      sy[i] = GH / 2;
+    }
+    uint8_t fx, fy;
+    auto placeFood = [&]() {
+      bool ok;
+      do {
+        fx = random(GW);
+        fy = random(GH);
+        ok = true;
+        for (uint16_t i = 0; i < len; i++)
+          if (sx[i] == fx && sy[i] == fy) { ok = false; break; }
+      } while (!ok);
+    };
+    placeFood();
+
+    uint16_t score = 0;
+    bool dead = false;
+    unsigned long lastTick = millis();
+
+    while (!dead) {
+      if (digitalRead(PIN_ESC) == LOW) { exitGame = true; break; }
+
+      int vx = getJoyX(), vy = getJoyY();
+      uint8_t want = nextDir;
+      if (vx < 300) want = 0;
+      else if (vy < 300) want = 1;
+      else if (vx > 700) want = 2;
+      else if (vy > 700) want = 3;
+      if ((want + 2) % 4 != dir) nextDir = want;
+
+      unsigned long interval = max(60, 150 - (int)score * 3);
+      if (millis() - lastTick >= interval) {
+        lastTick = millis();
+        dir = nextDir;
+        int8_t nx = (int8_t)sx[0] + dx[dir];
+        int8_t ny = (int8_t)sy[0] + dy[dir];
+
+        if (nx < 0 || nx >= GW || ny < 0 || ny >= GH) dead = true;
+        else {
+          bool eat = (nx == fx && ny == fy);
+          uint16_t check = eat ? len : len - 1;
+          for (uint16_t i = 0; i < check; i++) if (sx[i] == nx && sy[i] == ny) { dead = true; break; }
+          if (!dead) {
+            if (eat && len < 360) len++;
+            for (int16_t i = len - 1; i > 0; i--) { sx[i] = sx[i-1]; sy[i] = sy[i-1]; }
+            sx[0] = nx; sy[0] = ny;
+            if (eat) {
+              score++;
+              if (score > best) best = score;
+              if (len >= GW * GH) dead = true; else placeFood();
+            }
+          }
+        }
+      }
+
+      display.clearDisplay();
+      display.setTextSize(1);
+      display.setTextColor(SSD1306_WHITE);
+      display.setCursor(0, 2);
+      display.print(isEnglish ? F("SNAKE  Score:") : F("SNAKE  Puntos:"));
+      display.print(score);
+      display.drawRect(OX - 1, OY - 2, GW * CELL + 2, GH * CELL + 4, SSD1306_WHITE);
+      display.fillRect(OX + fx * CELL, OY + fy * CELL, CELL - 1, CELL - 1, SSD1306_WHITE);
+      for (uint16_t i = 0; i < len; i++) {
+        if (i == 0) display.fillRect(OX + sx[i] * CELL, OY + sy[i] * CELL, CELL, CELL, SSD1306_WHITE);
+        else display.fillRect(OX + sx[i] * CELL, OY + sy[i] * CELL, CELL - 1, CELL - 1, SSD1306_WHITE);
+      }
+      flushScreen();
+      delay(5);
+    }
+
+    saveBest("snake", best);
+    if (exitGame) break;
+
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setCursor(34, 6);  display.print(F("GAME OVER"));
+    display.setCursor(20, 22); display.print(isEnglish ? F("Score: ") : F("Puntos: ")); display.print(score);
+    display.setCursor(20, 33); display.print(isEnglish ? F("Best:  ") : F("Record: ")); display.print(best);
+    display.setCursor(8, 48);  display.print(isEnglish ? F("OK: again  ESC: exit") : F("OK:otra  ESC:salir"));
+    flushScreen();
+    delay(500);
+    while (true) {
+      if (digitalRead(PIN_OK) == LOW) { delay(250); break; }
+      if (digitalRead(PIN_ESC) == LOW) { exitGame = true; break; }
+      delay(10);
+    }
+  }
+  delay(300);
+}
+
+bool gameOverScreen(uint16_t score, uint16_t best) {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(34, 6);  display.print(F("GAME OVER"));
+  display.setCursor(20, 22); display.print(isEnglish ? F("Score: ") : F("Puntos: ")); display.print(score);
+  display.setCursor(20, 33); display.print(isEnglish ? F("Best:  ") : F("Record: ")); display.print(best);
+  display.setCursor(8, 48);  display.print(isEnglish ? F("OK: again  ESC: exit") : F("OK:otra  ESC:salir"));
+  flushScreen();
+  delay(500);
+  while (true) {
+    if (digitalRead(PIN_OK) == LOW) { delay(250); return true; }
+    if (digitalRead(PIN_ESC) == LOW) return false;
+    delay(10);
+  }
+}
+
+// ===================== DINO =====================
+void runDino() {
+  static uint16_t best = 0; static bool bestLd = false;
+  if (!bestLd) { best = loadBest("dino"); bestLd = true; }
+  const uint8_t GROUND = 54;
+  const uint8_t DX = 14;
+  randomSeed(micros());
+  delay(300);
+
+  bool quit = false;
+  while (!quit) {
+    float h = 0, vy = 0;
+    bool onGround = true;
+    float ox[3]; uint8_t ow[3], oh[3];
+    for (uint8_t i = 0; i < 3; i++) {
+      ox[i] = 140 + i * 110 + random(0, 30);
+      ow[i] = random(5, 9); oh[i] = random(9, 17);
+    }
+    uint32_t frames = 0;
+    uint16_t score = 0;
+    bool dead = false;
+    unsigned long last = millis();
+
+    while (!dead && !quit) {
+      if (digitalRead(PIN_ESC) == LOW) { quit = true; break; }
+      if (millis() - last < 30) { delay(1); continue; }
+      last = millis();
+      frames++;
+
+      score = frames / 4;
+      if (score > best) best = score;
+      float speed = 2.6 + min(1.4f, score * 0.004f);
+
+      bool jump = (digitalRead(PIN_OK) == LOW) || (digitalRead(PIN_3) == LOW) || (getJoyY() > 700);
+      if (jump && onGround) { vy = 5.6; onGround = false; }
+      if (!onGround) {
+        h += vy; vy -= 0.5;
+        if (h <= 0) { h = 0; vy = 0; onGround = true; }
+      }
+
+      for (uint8_t i = 0; i < 3; i++) {
+        ox[i] -= speed;
+        if (ox[i] + ow[i] < 0) {
+          float farX = ox[0];
+          for (uint8_t j = 1; j < 3; j++) if (ox[j] > farX) farX = ox[j];
+          if (farX < 128) farX = 128;
+          ox[i] = farX + random(100, 150) + (speed - 2.6) * 15;
+          ow[i] = random(5, 9); oh[i] = random(9, 17);
+        }
+      }
+
+      int dTop = GROUND - (int)h - 10, dBot = GROUND - (int)h;
+      for (uint8_t i = 0; i < 3; i++) {
+        int cx0 = (int)ox[i], cx1 = cx0 + ow[i], cTop = GROUND - oh[i];
+        if (DX + 7 > cx0 && DX + 1 < cx1 && dBot - 1 > cTop && dTop + 1 < GROUND) dead = true;
+      }
+
+      display.clearDisplay();
+      display.setTextSize(1); display.setTextColor(SSD1306_WHITE);
+      display.setCursor(0, 0);
+      display.print(F("HI ")); display.print(best);
+      display.setCursor(80, 0);
+      display.print(score);
+      display.drawFastHLine(0, GROUND, 128, SSD1306_WHITE);
+      for (int x = -(int)((frames * 3) % 16); x < 128; x += 16) display.drawPixel(x + 6, GROUND + 3, SSD1306_WHITE);
+
+      display.fillRect(DX, dTop + 2, 6, 6, SSD1306_WHITE);
+      display.fillRect(DX + 3, dTop, 5, 4, SSD1306_WHITE);
+      display.drawPixel(DX + 6, dTop + 1, SSD1306_BLACK);
+      display.drawPixel(DX - 1, dTop + 3, SSD1306_WHITE);
+      if (!onGround || (frames & 4)) display.fillRect(DX + 1, dTop + 8, 2, 2, SSD1306_WHITE);
+      else display.fillRect(DX + 4, dTop + 8, 2, 2, SSD1306_WHITE);
+
+      for (uint8_t i = 0; i < 3; i++) {
+        int x = (int)ox[i];
+        if (x > 127) continue;
+        int top = GROUND - oh[i];
+        display.fillRect(x + ow[i] / 2 - 1, top, 3, oh[i], SSD1306_WHITE);
+        display.fillRect(x, top + 3, 2, 4, SSD1306_WHITE);
+        display.fillRect(x + ow[i] - 2, top + 5, 2, 4, SSD1306_WHITE);
+      }
+      flushScreen();
+    }
+
+    if (quit) break;
+    saveBest("dino", best); if (!gameOverScreen(score, best)) quit = true;
+  }
+  delay(300);
+}
+
+// ===================== BREAKOUT =====================
+void runBreakout() {
+  static uint16_t best = 0; static bool bestLd = false;
+  if (!bestLd) { best = loadBest("breakout"); bestLd = true; }
+  const uint8_t PW = 20;
+  randomSeed(micros());
+  delay(300);
+
+  bool quit = false;
+  while (!quit) {
+    bool bricks[4][10];
+    for (uint8_t r = 0; r < 4; r++) for (uint8_t c = 0; c < 10; c++) bricks[r][c] = true;
+    uint8_t left = 40, lives = 3, level = 1;
+    uint16_t score = 0;
+    float spd = 1.8, px = 54;
+    float bx = 64, by = 57, vx = 0, vy = 0;
+    bool launched = false, dead = false;
+    unsigned long last = millis();
+
+    while (!dead && !quit) {
+      if (digitalRead(PIN_ESC) == LOW) { quit = true; break; }
+      if (millis() - last < 25) { delay(1); continue; }
+      last = millis();
+
+      int jx = getJoyX();
+      if (jx < 300) px += 3.5; else if (jx > 700) px -= 3.5;
+      px = constrain(px, 1, 127 - PW);
+
+      if (!launched) {
+        bx = px + PW / 2; by = 57;
+        if (digitalRead(PIN_OK) == LOW) {
+          launched = true;
+          vx = (random(2) ? 0.8 : -0.8);
+          vy = -sqrt(spd * spd - vx * vx);
+        }
+      } else {
+        bx += vx; by += vy;
+        if (bx < 1)   { bx = 1;   vx = -vx; }
+        if (bx > 125) { bx = 125; vx = -vx; }
+        if (by < 10)  { by = 10;  vy = -vy; }
+
+        if (vy > 0 && by + 2 >= 60 && by <= 62 && bx + 2 >= px && bx <= px + PW) {
+          float rel = (bx + 1 - (px + PW / 2.0)) / (PW / 2.0);
+          vx = constrain(rel * spd * 0.85, -spd * 0.85, spd * 0.85);
+          vy = -sqrt(spd * spd - vx * vx);
+          by = 58;
+        }
+
+        if (bx >= 4 && bx < 124 && by >= 12 && by < 32) {
+          uint8_t c = (uint8_t)((bx - 4) / 12), r = (uint8_t)((by - 12) / 5);
+          if (c < 10 && r < 4 && bricks[r][c]) {
+            bricks[r][c] = false; left--;
+            score += 10;
+            if (score > best) best = score;
+            vy = -vy;
+          }
+        }
+
+        if (by > 63) {
+          lives--;
+          launched = false;
+          delay(400);
+          if (lives == 0) dead = true;
+        }
+
+        if (left == 0) {
+          level++;
+          spd = min(3.0f, spd + 0.3f);
+          for (uint8_t r = 0; r < 4; r++) for (uint8_t c = 0; c < 10; c++) bricks[r][c] = true;
+          left = 40; launched = false;
+          delay(500);
+        }
+      }
+
+      display.clearDisplay();
+      display.setTextSize(1); display.setTextColor(SSD1306_WHITE);
+      display.setCursor(0, 1);  display.print(score);
+      display.setCursor(50, 1); display.print(F("Lv")); display.print(level);
+      display.setCursor(96, 1); display.print(F("L:")); display.print(lives);
+      display.drawFastHLine(0, 9, 128, SSD1306_WHITE);
+      for (uint8_t r = 0; r < 4; r++)
+        for (uint8_t c = 0; c < 10; c++)
+          if (bricks[r][c]) display.fillRect(4 + c * 12, 12 + r * 5, 11, 4, SSD1306_WHITE);
+      display.fillRect((int)px, 60, PW, 3, SSD1306_WHITE);
+      display.fillRect((int)bx, (int)by, 2, 2, SSD1306_WHITE);
+      if (!launched && !dead) {
+        display.setCursor(30, 40);
+        display.print(isEnglish ? F("OK: launch") : F("OK: lanzar"));
+      }
+      flushScreen();
+    }
+
+    if (quit) break;
+    saveBest("breakout", best); if (!gameOverScreen(score, best)) quit = true;
+  }
+  delay(300);
+}
+
+// ===================== FLAPPY (saltos más bajos) =====================
+void runFlappy() {
+  static uint16_t best = 0; static bool bestLd = false;
+  if (!bestLd) { best = loadBest("flappy"); bestLd = true; }
+  const uint8_t PIPEW = 10, GAP = 27, BX = 28, BW = 7, BH = 5;
+  randomSeed(micros());
+  delay(300);
+
+  bool quit = false;
+  while (!quit) {
+    float by = 28, vy = 0;
+    float px[3]; uint8_t gy[3]; bool passed[3];
+    for (uint8_t i = 0; i < 3; i++) {
+      px[i] = 128 + i * 52; gy[i] = random(10, 33); passed[i] = false;
+    }
+    uint16_t score = 0;
+    uint32_t frames = 0;
+    bool started = false, dead = false, prev = true;
+    unsigned long last = millis();
+
+    while (!dead && !quit) {
+      if (digitalRead(PIN_ESC) == LOW) { quit = true; break; }
+      if (millis() - last < 30) { delay(1); continue; }
+      last = millis();
+      frames++;
+
+      bool flap = (digitalRead(PIN_OK) == LOW) || (digitalRead(PIN_3) == LOW) || (getJoyY() > 700);
+      bool edge = flap && !prev;
+      prev = flap;
+
+      if (!started) {
+        by = 28 + sin(millis() / 200.0) * 3;
+        if (edge) { started = true; vy = -2.15; }
+      } else {
+        if (edge) vy = -2.15;
+        vy += 0.19; if (vy > 3.8) vy = 3.8;
+        by += vy;
+
+        for (uint8_t i = 0; i < 3; i++) {
+          px[i] -= 1.45;
+          if (px[i] < -PIPEW - 2) {
+            float farX = px[0];
+            for (uint8_t j = 1; j < 3; j++) if (px[j] > farX) farX = px[j];
+            px[i] = farX + 52; gy[i] = random(10, 33); passed[i] = false;
+          }
+          if (!passed[i] && px[i] + PIPEW < BX) {
+            passed[i] = true; score++;
+            if (score > best) best = score;
+          }
+          if (BX + BW - 1 > px[i] && BX + 1 < px[i] + PIPEW && 
+              (by + 1 < gy[i] || by + BH - 1 > gy[i] + GAP)) {
+            dead = true;
+          }
+        }
+        if (by < 0 || by + BH >= 62) dead = true;
+      }
+
+      display.clearDisplay();
+      for (uint8_t i = 0; i < 3; i++) {
+        int x = (int)px[i];
+        if (x > 127 || x < -PIPEW - 2) continue;
+        display.drawRect(x, -1, PIPEW, gy[i] + 1, SSD1306_WHITE);
+        display.drawRect(x - 1, gy[i] - 4, PIPEW + 2, 4, SSD1306_WHITE);
+        display.drawRect(x, gy[i] + GAP, PIPEW, 64 - gy[i] - GAP, SSD1306_WHITE);
+        display.drawRect(x - 1, gy[i] + GAP, PIPEW + 2, 4, SSD1306_WHITE);
+      }
+      display.drawFastHLine(0, 62, 128, SSD1306_WHITE);
+      int off = (frames * 2) % 8;
+      for (int x = -off; x < 128; x += 8) display.drawFastHLine(x, 63, 4, SSD1306_WHITE);
+
+      int iy = (int)by;
+      display.fillRect(BX, iy, BW, BH, SSD1306_WHITE);
+      display.drawPixel(BX + 5, iy + 1, SSD1306_BLACK);
+      display.drawPixel(BX + 2, iy + 2, SSD1306_BLACK);
+      display.fillRect(BX + BW, iy + 2, 2, 1, SSD1306_WHITE);
+
+      display.setTextSize(1); display.setTextColor(SSD1306_WHITE, SSD1306_BLACK);
+      display.setCursor(1, 1);
+      display.print(score);
+      display.setTextColor(SSD1306_WHITE);
+      if (!started) {
+        display.setCursor(22, 46);
+        display.print(isEnglish ? F("OK: flap!") : F("OK: aletear"));
+      }
+      flushScreen();
+    }
+
+    if (quit) break;
+    saveBest("flappy", best); if (!gameOverScreen(score, best)) quit = true;
+  }
+  delay(300);
+}
+
+// ===================== MORTAL KOMBAT: MOTOR DE SPRITES =====================
+// Cada luchador se arma en una mascara de 27x24 (1 = blanco, 2 = detalle negro).
+// Mira a la derecha; se voltea al dibujar. El clon de Noob se dibuja solo con el borde.
+static uint8_t mkM[MK_CH][MK_CW];
+
+static void mkPut(int x, int y, uint8_t v) {
+  x += 8;                                   // x local: 0..10 = cuerpo
+  if (x < 0 || x >= MK_CW || y < 0 || y >= MK_CH) return;
+  mkM[y][x] = v;
+}
+static void mkBox(int x, int y, int w, int h, uint8_t v) {
+  for (int j = 0; j < h; j++) for (int i = 0; i < w; i++) mkPut(x + i, y + j, v);
+}
+static void mkLn(int x0, int y0, int x1, int y1, uint8_t v) {
+  int dx = abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
+  int dy = -abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
+  int err = dx + dy;
+  while (true) {
+    mkPut(x0, y0, v);
+    if (x0 == x1 && y0 == y1) break;
+    int e2 = 2 * err;
+    if (e2 >= dy) { err += dy; x0 += sx; }
+    if (e2 <= dx) { err += dx; y0 += sy; }
+  }
+}
+static void mkTh(int x0, int y0, int x1, int y1, uint8_t v) {   // linea de 2 px de grosor
+  mkLn(x0, y0, x1, y1, v);
+  mkLn(x0 + 1, y0, x1 + 1, y1, v);
+}
+
+// ---------- Piernas ----------
+static void mkLegs(uint8_t pose, uint8_t fr) {
+  if (pose == PO_FALL) {                    // piernas abiertas (tumbo en el portal)
+    mkTh(3, 17, 0, 23, 1); mkTh(6, 17, 9, 23, 1);
+    return;
+  }
+  if (pose == PO_KICK || pose == PO_AIRKICK) {
+    mkBox(2, 17, 2, 6, 1); mkBox(2, 23, 3, 1, 1);               // pierna de apoyo
+    bool ext = (pose == PO_KICK) ? (fr == 1) : (fr == 0);
+    if (pose == PO_AIRKICK && fr == 1) {                         // patada baja
+      mkTh(6, 17, 12, 21, 1); mkBox(12, 21, 3, 2, 1);
+    } else if (ext) {                                            // patada extendida
+      mkBox(6, 16, 9, 2, 1); mkBox(14, 14, 2, 5, 1);
+    } else {                                                     // rodilla arriba
+      mkBox(6, 15, 3, 2, 1); mkBox(8, 15, 2, 6, 1); mkBox(8, 21, 3, 1, 1);
+    }
+    return;
+  }
+  if (pose == PO_WALK && fr == 1) {                              // zancada larga
+    mkTh(3, 17, 1, 23, 1); mkBox(0, 23, 3, 1, 1);
+    mkTh(6, 17, 8, 23, 1); mkBox(7, 23, 3, 1, 1);
+    return;
+  }
+  if (pose == PO_WALK && fr == 3) {                              // piernas juntas
+    mkBox(3, 17, 2, 6, 1); mkBox(3, 23, 2, 1, 1);
+    mkBox(6, 17, 2, 6, 1); mkBox(6, 23, 2, 1, 1);
+    return;
+  }
+  if (pose == PO_HIT) {                                          // echado hacia atras
+    mkBox(1, 17, 2, 6, 1); mkBox(1, 23, 3, 1, 1);
+    mkBox(5, 17, 2, 6, 1); mkBox(5, 23, 3, 1, 1);
+    return;
+  }
+  mkBox(2, 17, 2, 6, 1); mkBox(2, 23, 3, 1, 1);                  // postura base
+  mkBox(6, 17, 2, 6, 1); mkBox(6, 23, 3, 1, 1);
+}
+
+// ---------- Torso (con el detalle de cada personaje) ----------
+static void mkTorsoF(uint8_t id, int L) {
+  mkBox(3 + L, 10, 5, 2, 1);                    // hombros finos
+  mkBox(4 + L, 12, 3, 2, 1);                    // cintura marcada
+  mkBox(3 + L, 14, 5, 1, 1);
+  mkBox(2 + L, 15, 7, 2, 1);                    // caderas anchas
+  if (id == 8) {            // KITANA: leotardo con escote en V, fajin y cadera
+    mkPut(5 + L, 10, 2); mkPut(4 + L, 11, 2); mkPut(6 + L, 11, 2);
+    mkBox(4 + L, 13, 3, 1, 2);
+    mkBox(2 + L, 15, 7, 1, 2); mkPut(5 + L, 16, 2);
+  } else {                  // SONYA: top corto oscuro con placa, abdomen al aire, cinturon militar
+    mkBox(3 + L, 10, 5, 2, 2); mkPut(5 + L, 11, 1);
+    mkPut(5 + L, 13, 2);
+    mkBox(2 + L, 15, 7, 1, 2); mkPut(5 + L, 15, 1);
+  }
+}
+
+static void mkTorso(uint8_t id, int L) {
+  if (id >= 8) { mkTorsoF(id, L); return; }
+  mkBox(2 + L, 10, 7, 7, 1);
+  switch (id) {
+    case 0:   // SCORPION: banda cruzada gruesa, cinturon con calavera, cuerda de kunai
+      mkLn(3 + L, 10, 7 + L, 14, 2); mkLn(3 + L, 11, 7 + L, 15, 2); mkLn(4 + L, 10, 8 + L, 14, 2);
+      mkBox(2 + L, 16, 7, 1, 2); mkPut(5 + L, 16, 1);
+      mkPut(1 + L, 15, 1); mkPut(0 + L, 16, 1); mkPut(0 + L, 17, 1); mkPut(1 + L, 18, 1);
+      break;
+    case 1:   // SUB-ZERO: hombreras anchas con picos de hielo, copo en el pecho
+      mkBox(0 + L, 10, 11, 2, 1); mkPut(0 + L, 9, 1); mkPut(10 + L, 9, 1); mkPut(0 + L, 8, 1); mkPut(10 + L, 8, 1);
+      mkBox(5 + L, 12, 1, 3, 2); mkBox(4 + L, 13, 3, 1, 2);
+      mkBox(2 + L, 16, 7, 1, 2); mkBox(0 + L, 11, 1, 1, 2); mkBox(10 + L, 11, 1, 1, 2);
+      break;
+    case 2:   // LIU KANG: pecho descubierto (pectorales y abdomen), faja de pantalon
+      mkBox(3 + L, 12, 2, 1, 2); mkBox(6 + L, 12, 2, 1, 2);
+      mkBox(4 + L, 14, 3, 1, 2);
+      mkBox(2 + L, 16, 7, 1, 2);
+      break;
+    case 3:   // KUNG LAO: chaleco abierto en V, faja
+      mkLn(3 + L, 10, 5 + L, 14, 2); mkLn(7 + L, 10, 5 + L, 14, 2);
+      mkBox(2 + L, 16, 7, 1, 2); mkPut(5 + L, 15, 2);
+      break;
+    case 4:   // RAIDEN: tunica con rayo, hombreras
+      mkBox(0 + L, 10, 11, 1, 1);
+      mkLn(6 + L, 11, 4 + L, 13, 2); mkLn(4 + L, 13, 6 + L, 13, 2); mkLn(6 + L, 13, 4 + L, 16, 2);
+      mkBox(2 + L, 16, 7, 1, 2);
+      break;
+    case 5:   // NOOB: arnes en X y bufanda
+      mkLn(3 + L, 10, 7 + L, 15, 2); mkLn(7 + L, 10, 3 + L, 15, 2);
+      mkBox(2 + L, 16, 7, 1, 2);
+      mkPut(2 + L, 9, 1); mkPut(1 + L, 10, 1); mkPut(0 + L, 10, 1); mkPut(-1 + L, 11, 1);
+      break;
+    case 6:   // TERMINATOR: caja toracica metalica y hombros enormes
+      mkBox(0 + L, 10, 11, 2, 1);
+      mkBox(3 + L, 12, 5, 1, 2); mkBox(3 + L, 14, 5, 1, 2);
+      mkBox(2 + L, 16, 7, 1, 2); mkPut(5 + L, 12, 1); mkPut(5 + L, 14, 1);
+      break;
+    case 7:   // KANO: chaleco abierto, pectorales y cinturon ancho
+      mkBox(2 + L, 11, 1, 5, 2); mkBox(8 + L, 11, 1, 5, 2);
+      mkBox(3 + L, 12, 2, 1, 2); mkBox(6 + L, 12, 2, 1, 2); mkBox(4 + L, 14, 3, 1, 2);
+      mkBox(2 + L, 16, 7, 1, 2); mkPut(5 + L, 16, 1);
+      break;
+  }
+}
+
+// ---------- Cabeza (7x6, filas 4..9) ----------
+static void mkHeadF(uint8_t id, int L) {
+  mkBox(2 + L, 4, 7, 6, 1);                      // rostro
+  mkPut(2 + L, 9, 0); mkPut(8 + L, 9, 0);         // barbilla mas fina
+  if (id == 8) {            // KITANA: coronilla, cabello negro largo, mascara en la boca
+    mkPut(3 + L, 3, 1); mkPut(5 + L, 2, 1); mkPut(5 + L, 3, 1); mkPut(7 + L, 3, 1);
+    mkBox(2 + L, 4, 7, 1, 2); mkPut(2 + L, 5, 2); mkPut(8 + L, 5, 2);
+    mkBox(0 + L, 4, 2, 9, 1); mkPut(1 + L, 7, 2); mkPut(1 + L, 10, 2);   // melena larga detras
+    mkPut(5 + L, 6, 2); mkPut(7 + L, 6, 2);
+    mkBox(4 + L, 8, 5, 2, 2);
+  } else {                  // SONYA: coleta alta rubia, cinta, labios
+    mkBox(3 + L, 3, 5, 1, 1);
+    mkBox(2 + L, 5, 7, 1, 2);
+    mkBox(0 + L, 3, 2, 2, 1); mkBox(-1 + L, 5, 2, 3, 1); mkBox(-1 + L, 8, 2, 3, 1); mkPut(0 + L, 11, 1);   // cola de caballo
+    mkPut(5 + L, 7, 2); mkPut(7 + L, 7, 2);
+    mkBox(6 + L, 9, 2, 1, 2);
+  }
+}
+
+static void mkHead(uint8_t id, int L) {
+  if (id >= 8) { mkHeadF(id, L); return; }
+  mkBox(2 + L, 4, 7, 6, 1);
+  switch (id) {
+    case 0:   // SCORPION: capucha con antifaz, solo se ven los ojos
+      mkBox(2 + L, 6, 7, 2, 2); mkPut(4 + L, 6, 1); mkPut(6 + L, 6, 1);
+      mkBox(2 + L, 9, 7, 1, 2);
+      break;
+    case 1:   // SUB-ZERO: capucha oscura, ojos de hielo y mascara
+      mkBox(2 + L, 4, 7, 1, 2); mkPut(4 + L, 6, 2); mkPut(6 + L, 6, 2);
+      mkBox(2 + L, 8, 7, 2, 2); mkPut(5 + L, 8, 1);
+      break;
+    case 2:   // LIU KANG: pelo negro, cinta y cola
+      mkBox(2 + L, 5, 7, 1, 2); mkBox(2 + L, 6, 7, 1, 2);
+      mkPut(4 + L, 7, 2); mkPut(6 + L, 7, 2);
+      mkPut(1 + L, 6, 1); mkPut(0 + L, 7, 1); mkPut(0 + L, 8, 1); mkPut(-1 + L, 8, 1);
+      break;
+    case 3:   // KUNG LAO: ojos y bigote
+      mkPut(4 + L, 7, 2); mkPut(6 + L, 7, 2); mkBox(4 + L, 9, 4, 1, 2);
+      break;
+    case 4:   // RAIDEN: rostro en sombra con ojos brillantes y barba
+      mkBox(3 + L, 5, 5, 4, 2); mkPut(4 + L, 6, 1); mkPut(6 + L, 6, 1);
+      break;
+    case 5:   // NOOB: capucha puntiaguda, rostro negro con ojos blancos
+      mkBox(4 + L, 3, 3, 1, 1); mkPut(5 + L, 2, 1);
+      mkBox(3 + L, 5, 5, 4, 2); mkPut(4 + L, 6, 1); mkPut(6 + L, 6, 1);
+      break;
+    case 6:   // TERMINATOR: craneo metalico, cuencas y dientes
+      mkBox(3 + L, 6, 2, 2, 2); mkBox(6 + L, 6, 2, 2, 2); mkPut(6 + L, 7, 1);
+      mkPut(5 + L, 8, 2);
+      mkPut(2 + L, 9, 2); mkPut(4 + L, 9, 2); mkPut(6 + L, 9, 2); mkPut(8 + L, 9, 2);
+      break;
+    case 7:   // KANO: pelo negro peinado atras, placa cibernetica en el ojo y barba
+      mkBox(2 + L, 4, 7, 2, 2);
+      mkBox(3 + L, 6, 3, 2, 2); mkPut(4 + L, 6, 1); mkPut(7 + L, 7, 2);
+      mkBox(3 + L, 9, 5, 1, 2);
+      break;
+  }
+}
+
+// ---------- Sombrero / pelo (filas 0..4) ----------
+static void mkHat(uint8_t id, bool hat, int L) {
+  if (id == 3) {
+    if (hat) {                                // sombrero con punta y aro metalico
+      mkPut(5 + L, 0, 1); mkBox(4 + L, 1, 3, 1, 1); mkBox(3 + L, 2, 5, 1, 1);
+      mkBox(1 + L, 3, 9, 1, 1); mkBox(-1 + L, 4, 13, 1, 1);
+      mkPut(1 + L, 4, 2); mkPut(5 + L, 4, 2); mkPut(9 + L, 4, 2); mkPut(5 + L, 2, 2);
+    } else {                                  // mono
+      mkPut(5 + L, 2, 1); mkBox(4 + L, 3, 3, 1, 1);
+    }
+  } else if (id == 4) {
+    if (hat) {                                // sombrero de paja grande con rayo
+      mkBox(4 + L, 0, 3, 1, 1); mkBox(3 + L, 1, 5, 1, 1); mkBox(1 + L, 2, 9, 1, 1);
+      mkBox(0 + L, 3, 11, 1, 1); mkBox(-2 + L, 4, 15, 1, 1);
+      mkPut(6 + L, 1, 2); mkPut(5 + L, 2, 2); mkPut(6 + L, 2, 2); mkPut(5 + L, 3, 2);
+    } else {                                  // pelo canoso
+      mkBox(4 + L, 2, 3, 1, 1); mkBox(3 + L, 3, 5, 1, 1);
+    }
+  }
+}
+
+// ---------- Guardia: una animacion distinta por luchador ----------
+// fr 0 = levantando la guardia, fr 1 = guardia completa
+static void mkBlockArms(uint8_t id, uint8_t fr, int L) {
+  if (fr == 0) {                                             // subiendo los brazos
+    mkBox(8 + L, 9, 2, 6, 1); mkBox(1 + L, 12, 2, 5, 1);
+    return;
+  }
+  switch (id) {
+    case 0:   // SCORPION: brazos cruzados en X sobre el pecho
+      mkTh(7 + L, 10, 10 + L, 16, 1); mkTh(7 + L, 16, 10 + L, 10, 1);
+      mkPut(9 + L, 13, 2);
+      break;
+    case 1:   // SUB-ZERO: escudo de hielo (diamante) delante
+      mkBox(8 + L, 8, 2, 7, 1);
+      mkLn(12 + L, 5, 15 + L, 10, 1); mkLn(15 + L, 10, 12 + L, 16, 1);
+      mkLn(12 + L, 16, 10 + L, 10, 1); mkLn(10 + L, 10, 12 + L, 5, 1);
+      mkPut(12 + L, 8, 1); mkPut(13 + L, 11, 1);
+      break;
+    case 2:   // LIU KANG: guardia baja de kung fu, un brazo arriba y otro cruzando la cintura
+      mkBox(8 + L, 5, 2, 8, 1); mkBox(8 + L, 4, 3, 2, 1);
+      mkBox(4 + L, 14, 7, 2, 1);
+      break;
+    case 3:   // KUNG LAO: postura de grulla, palma abierta delante y otro brazo en alto detras
+      mkBox(8 + L, 6, 2, 8, 1); mkPut(10 + L, 4, 1); mkPut(11 + L, 5, 1); mkPut(11 + L, 7, 1); mkBox(10 + L, 5, 1, 3, 1);
+      mkTh(2 + L, 11, 0 + L, 5, 1); mkPut(-1 + L, 4, 1);
+      break;
+    case 4:   // RAIDEN: barrera de rayos
+      mkBox(8 + L, 8, 2, 6, 1);
+      mkLn(12 + L, 4, 14 + L, 8, 1); mkLn(14 + L, 8, 12 + L, 11, 1);
+      mkLn(12 + L, 11, 14 + L, 15, 1); mkLn(14 + L, 15, 12 + L, 17, 1);
+      break;
+    case 5:   // NOOB: brazos en X y estela de sombra detras
+      mkTh(7 + L, 10, 10 + L, 16, 1); mkTh(7 + L, 16, 10 + L, 10, 1);
+      mkPut(-1 + L, 10, 1); mkPut(-1 + L, 12, 1); mkPut(-1 + L, 14, 1);
+      mkPut(-3 + L, 11, 1); mkPut(-3 + L, 13, 1);
+      break;
+    case 8:   // KITANA: abanico de acero abierto delante
+      mkBox(8 + L, 8, 2, 6, 1);
+      mkLn(11 + L, 12, 11 + L, 4, 1); mkLn(11 + L, 12, 14 + L, 5, 1); mkLn(11 + L, 12, 15 + L, 8, 1); mkLn(11 + L, 12, 15 + L, 11, 1);
+      mkLn(11 + L, 4, 14 + L, 5, 1); mkLn(14 + L, 5, 15 + L, 8, 1); mkLn(15 + L, 8, 15 + L, 11, 1);
+      mkPut(12 + L, 8, 2); mkPut(13 + L, 9, 2);
+      break;
+    case 9:   // SONYA: guardia de boxeo, punos delante de la cara
+      mkBox(8 + L, 6, 3, 3, 1); mkBox(7 + L, 9, 2, 5, 1); mkBox(11 + L, 7, 2, 2, 1);
+      mkBox(5 + L, 12, 3, 3, 1); mkPut(9 + L, 7, 2);
+      break;
+    case 7:   // KANO: se cubre la cara con los antebrazos cruzados
+      mkBox(8 + L, 3, 2, 9, 1); mkBox(10 + L, 5, 2, 9, 1); mkPut(9 + L, 2, 1);
+      mkPut(9 + L, 8, 2); mkPut(11 + L, 10, 2);
+      break;
+    default:  // TERMINATOR: placa de blindaje en el antebrazo
+      mkBox(8 + L, 6, 4, 10, 1);
+      mkBox(9 + L, 8, 2, 1, 2); mkBox(9 + L, 11, 2, 1, 2); mkBox(9 + L, 14, 2, 1, 2);
+      break;
+  }
+}
+
+// ---------- Brazos (hombro en fila 11) ----------
+static void mkArms(uint8_t id, uint8_t pose, uint8_t fr, int L) {
+  switch (pose) {
+    case PO_PUNCH:
+      if (fr == 0) { mkBox(7 + L, 11, 3, 2, 1); mkBox(1 + L, 12, 2, 5, 1); }
+      else if (fr == 1) { mkBox(8 + L, 11, 5, 2, 1); mkBox(12 + L, 10, 3, 3, 1); mkBox(1 + L, 12, 2, 5, 1); }
+      else { mkBox(8 + L, 11, 3, 2, 1); mkBox(10 + L, 10, 2, 3, 1); mkBox(1 + L, 12, 2, 5, 1); }
+      break;
+    case PO_KICK: case PO_AIRKICK:
+      mkTh(8 + L, 12, 10 + L, 9, 1); mkTh(1 + L, 12, -1 + L, 14, 1);
+      break;
+    case PO_BLOCK:
+      mkBlockArms(id, fr, L);
+      break;
+    case PO_HIT:
+      mkTh(2 + L, 11, -1 + L, 8, 1); mkTh(8 + L, 12, 10 + L, 15, 1);
+      break;
+    case PO_WIN:
+      mkBox(9 + L, 0, 2, 11, 1); mkBox(0 + L, 1, 2, 10, 1);
+      break;
+    case PO_CAST:
+      mkBox(8 + L, 11, 5, 2, 1); mkBox(12 + L, 10, 3, 3, 1);
+      mkBox(7 + L, 14, 4, 2, 1); mkBox(1 + L, 12, 2, 5, 1);
+      break;
+    case PO_FALL:
+      mkTh(2 + L, 11, -1 + L, 4, 1); mkTh(8 + L, 11, 10 + L, 4, 1);
+      break;
+    default:                                  // guardia
+      mkTh(8 + L, 12, 10 + L, 10, 1); mkBox(10 + L, 9, 2, 2, 1);
+      mkBox(1 + L, 12, 2, 5, 1);
+      break;
+  }
+}
+
+// ---------- Derribado (KO) ----------
+static void mkBuildKO(uint8_t id, bool hat) {
+  mkBox(-5, 19, 5, 5, 1);                      // cabeza
+  mkBox(0, 20, 7, 4, 1);                       // torso
+  mkBox(7, 21, 8, 3, 1);                       // piernas
+  mkBox(2, 18, 5, 2, 1);                       // brazo
+  mkPut(-4, 21, 2); mkPut(-2, 21, 2);          // ojos en X
+  mkPut(-3, 22, 2);
+  mkBox(1, 22, 5, 1, 2);                       // cinturon
+  mkBox(13, 22, 2, 1, 2);
+  if (id == 3 && hat) { mkBox(-8, 22, 3, 1, 1); mkBox(-9, 23, 5, 1, 1); }
+  if (id == 4 && hat) { mkBox(-8, 22, 3, 1, 1); mkBox(-10, 23, 7, 1, 1); }
+  if (id == 5) { mkPut(-6, 20, 1); mkPut(-7, 21, 1); }
+}
+
+static void mkBuild(uint8_t id, uint8_t pose, uint8_t fr, bool hat) {
+  memset(mkM, 0, sizeof(mkM));
+  if (pose == PO_KO) { mkBuildKO(id, hat); return; }
+  int L = 0;
+  if (pose == PO_HIT) L = -2;
+  else if (pose == PO_PUNCH && fr == 1) L = 1;
+  else if (pose == PO_KICK || pose == PO_AIRKICK) L = -1;
+  else if (pose == PO_BLOCK && fr == 1) L = -1;
+  mkLegs(pose, fr);
+  mkTorso(id, L);
+  mkHead(id, L);
+  mkHat(id, hat, L);
+  mkArms(id, pose, fr, L);
+}
+
+static uint8_t mkAt(int x, int y) {
+  if (x < 0 || x >= MK_CW || y < 0 || y >= MK_CH) return 0;
+  return mkM[y][x];
+}
+
+// Dibuja la mascara en pantalla. mode 0 = normal, mode 1 = solo borde (clon de Noob)
+static void mkBlit(int cx, int top, bool right, uint8_t mode, int clipT, int clipB, bool flipY) {
+  for (int y = 0; y < MK_CH; y++) {
+    int sy = flipY ? top + (MK_CH - 1 - y) : top + y;
+    if (sy < clipT || sy >= clipB || sy < 0 || sy >= 64) continue;
+    for (int x = 0; x < MK_CW; x++) {
+      int sx = cx - MK_CX + (right ? x : (MK_CW - 1 - x));
+      if (sx < 0 || sx >= 128) continue;
+      uint8_t v = mkM[y][x];
+      if (v) {
+        if (mode == 1) {
+          bool edge = !mkAt(x - 1, y) || !mkAt(x + 1, y) || !mkAt(x, y - 1) || !mkAt(x, y + 1);
+          display.drawPixel(sx, sy, edge ? SSD1306_WHITE : SSD1306_BLACK);
+        } else {
+          display.drawPixel(sx, sy, v == 1 ? SSD1306_WHITE : SSD1306_BLACK);
+        }
+      } else if (mkAt(x - 1, y) || mkAt(x + 1, y) || mkAt(x, y - 1) || mkAt(x, y + 1)) {
+        display.drawPixel(sx, sy, SSD1306_BLACK);          // halo negro para separar del fondo
+      }
+    }
+  }
+}
+
+// ===================== MORTAL KOMBAT: JUEGO =====================
+#define MKS_MENU 0
+#define MKS_SELECT 1
+#define MKS_INTRO 2
+#define MKS_FIGHT 3
+#define MKS_FINISH 4
+#define MKS_KO 5
+#define MKS_ROUND 6
+#define MKS_WIN 7
+#define MKS_LOSE 8
+#define MKS_DIFF 9
+#define MK_NEED 2          // rondas para ganar
+#define MK_NUM 10           // luchadores
+#define MK_CD_FRAMES 450   // 15 s de espera del especial (30 ms por cuadro)
+
+static const char* const mkNames[MK_NUM] = {"SCORPION", "SUB-ZERO", "LIU KANG", "KUNG LAO", "RAIDEN", "NOOB", "TERMINATOR", "KANO", "KITANA", "SONYA"};
+static const char* const mkSpName[MK_NUM] = {"SPEAR", "ICE BALL", "HEAD KICKS", "HAT TOSS", "LIGHTNING", "SHADOW", "SHOTGUN", "BALL ROLL", "FAN TOSS", "RINGS"};
+static const uint8_t mkSpType[MK_NUM] = {1, 2, 4, 5, 7, 6, 3, 8, 5, 9};       // 1 lanza 2 hielo 3 escopeta 4 patadas 5 sombrero 6 sombra 7 rayos 8 bala de canon 9 anillos
+static const uint8_t mkHpTab[MK_NUM] = {100, 115, 95, 100, 110, 105, 130, 105, 95, 105};
+static const uint8_t mkSpdTab[MK_NUM] = {20, 17, 24, 20, 18, 20, 16, 21, 23, 21};  // px por cuadro x10
+
+// Dificultad: 0 FACIL (la de antes), 1 NORMAL, 2 DIFICIL, 3 TRYHARD
+static const char* const mkDiffName[4] = {"EASY", "NORMAL", "HARD", "TRYHARD"};
+static const uint8_t mkDiffDmg[4] = {10, 12, 15, 18};     // dano del enemigo x10
+static const uint8_t mkDiffSpd[4] = {8, 9, 10, 12};       // velocidad del enemigo x10
+static const uint8_t mkDiffCd[4]  = {10, 15, 22, 32};     // divisor de espera entre golpes x10
+static const uint8_t mkDiffBlk[4] = {7, 12, 20, 35};      // % por cuadro de bloquear un golpe tuyo
+static const uint8_t mkDiffRet[4] = {40, 45, 55, 70};     // % de retroceder si lo pegas encima
+static const uint8_t mkDiffHp[4]  = {100, 100, 112, 125}; // vida del enemigo en %
+static uint8_t mkDiff = 0;
+static MKFighter mkF[2];            // 0 = jugador, 1 = enemigo
+#define mkP mkF[0]
+#define mkE mkF[1]
+static uint8_t mkRound = 1, mkPW = 0, mkEW = 0, mkSel = 0, mkSp = 0;
+static float mkTimer = 60000;
+static int16_t mkSpark = 0, mkSparkX = 0, mkSparkY = 0;
+static int16_t mkCD = 0;
+static uint8_t mkSpState = 0;
+static int16_t mkSpT = 0;
+static float mkLkX0 = 0;
+static bool mkProjOn = false;
+static uint8_t mkProjKind = 0;
+static float mkProjX = 0, mkProjDir = 1;
+static bool mkHatFly = false, mkHatBack = false, mkHatHit = false;
+static float mkHatX = 0, mkHatDir = 1, mkHatX0 = 0;
+static uint8_t mkHatFr = 0;
+static int16_t mkFrozenT = 0;
+static bool mkCloneOn = false, mkCloneRight = true;
+static float mkCloneX = 0;
+static uint8_t mkClonePose = PO_IDLE, mkCloneWalk = 0;
+static bool mkPortals = false;
+static float mkPortalX = 0, mkPortalR = 0, mkFallV = 0;
+static uint16_t mkFrame = 0;
+static int16_t mkBoltX = 64;
+
+// ---------- utilidades ----------
+static void mkCenter(const char* s, int y, uint8_t size) {
+  int w = (int)strlen(s) * 6 * size;
+  display.setTextSize(size);
+  display.setCursor((128 - w) / 2, y);
+  display.print(s);
+  display.setTextSize(1);
+}
+
+static void mkWaitRelease(uint8_t pin) {
+  unsigned long t0 = millis();
+  while (digitalRead(pin) == LOW && millis() - t0 < 1500) delay(5);
+}
+
+static void mkClampFighter(uint8_t fi) {
+  MKFighter &f = mkF[fi];
+  if (f.x < 10) f.x = 10;
+  if (f.x > 118) f.x = 118;
+}
+
+static void mkInitFighter(uint8_t fi, uint8_t id) {
+  MKFighter &f = mkF[fi];
+  f.id = id;
+  f.maxHp = mkHpTab[id];
+  f.spd = mkSpdTab[id] / 10.0f;
+}
+
+static void mkCancelSpecial() {
+  mkSpState = 0; mkSpT = 0;
+  mkProjOn = false; mkHatFly = false; mkFrozenT = 0;
+  mkCloneOn = false; mkPortals = false;
+  mkP.y = MK_SY; mkE.y = MK_SY; mkP.flip = false; mkE.flip = false;
+  mkP.hat = (mkP.id == 3 || mkP.id == 4);
+  if (mkP.act == MA_BUSY || mkP.act == MA_CAST) mkP.act = MA_IDLE;
+  if (mkE.act == MA_CAPT) mkE.act = MA_IDLE;
+}
+
+static void mkInitRound() {
+  mkP.x = 30; mkE.x = 98; mkP.right = true; mkE.right = false;
+  MKFighter* fs[2] = {&mkP, &mkE};
+  for (int i = 0; i < 2; i++) {
+    MKFighter &f = *fs[i];
+    f.y = MK_SY; f.hp = f.maxHp; f.act = MA_IDLE; f.t = 0; f.cd = 0; f.wf = 0; f.ov = PO_IDLE;
+    f.flip = false; f.damaged = false; f.hat = (f.id == 3 || f.id == 4);
+  }
+  mkCancelSpecial();
+  mkSpark = 0; mkCD = 0; mkTimer = 60000;
+}
+
+// Dano directo sin reaccion (para ticks de patadas, caida del portal)
+static void mkDamageRaw(uint8_t fi, float d) {
+  MKFighter &f = mkF[fi];
+  f.hp -= d; if (f.hp < 0) f.hp = 0;
+  f.damaged = true;
+}
+
+static void mkHurt(uint8_t ti, uint8_t si, float dmg, int push, bool unblockable) {
+  MKFighter &tgt = mkF[ti], &src = mkF[si];
+  if (tgt.act == MA_CAPT || tgt.act == MA_KO) return;
+  bool blocked = (!unblockable && tgt.act == MA_BLOCK && (tgt.right == (src.x > tgt.x)));
+  if (&tgt == &mkE && mkFrozenT > 0) dmg *= 1.2f;
+  if (blocked) { dmg *= 0.2f; push = 1; }
+  else tgt.damaged = true;
+  tgt.hp -= dmg; if (tgt.hp < 0) tgt.hp = 0;
+  if (!blocked && !(&tgt == &mkE && mkFrozenT > 0)) { tgt.act = MA_HIT; tgt.t = 7; }
+  tgt.x += (tgt.x >= src.x) ? push : -push;
+  mkClampFighter(ti);
+  mkSpark = 5; mkSparkX = (int)((tgt.x + src.x) / 2) + (tgt.x >= src.x ? 4 : -4); mkSparkY = (int)tgt.y + 12;
+}
+
+static void mkStartAttack(uint8_t ai, bool kick) {
+  MKFighter &a = mkF[ai];
+  a.act = kick ? MA_KICK : MA_PUNCH;
+  a.t = kick ? 14 : 10;
+}
+
+// Avanza un golpe en curso. El golpe conecta en un cuadro fijo (puno: t==6, patada: t==9).
+static void mkAttackStep(uint8_t ai, uint8_t bi, float dp, float dk) {
+  MKFighter &a = mkF[ai], &b = mkF[bi];
+  a.t--;
+  if (a.act == MA_PUNCH && a.t == 6) {
+    if (fabsf(a.x - b.x) <= 14) mkHurt(bi, ai, dp, 4, false);
+  } else if (a.act == MA_KICK && a.t == 9) {
+    if (fabsf(a.x - b.x) <= 17) mkHurt(bi, ai, dk, 6, false);
+  }
+  if (a.t <= 0) { a.act = MA_IDLE; a.cd = 4; }
+}
+
+static void mkPoseOf(uint8_t fi, uint8_t &pose, uint8_t &fr) {
+  MKFighter &f = mkF[fi];
+  fr = 0;
+  switch (f.act) {
+    case MA_WALK:  pose = PO_WALK; fr = (f.wf / 3) & 3; break;
+    case MA_PUNCH: pose = PO_PUNCH; fr = (f.t >= 7) ? 0 : ((f.t >= 4) ? 1 : 2); break;
+    case MA_KICK:  pose = PO_KICK;  fr = (f.t >= 10) ? 0 : ((f.t >= 6) ? 1 : 2); break;
+    case MA_BLOCK: pose = PO_BLOCK; fr = (f.wf < 3) ? 0 : 1; break;
+    case MA_HIT:   pose = PO_HIT; break;
+    case MA_KO:    pose = PO_KO; break;
+    case MA_WIN:   pose = PO_WIN; break;
+    case MA_CAST:  pose = PO_CAST; break;
+    case MA_BUSY:  pose = PO_AIRKICK; fr = (f.wf / 3) & 1; break;
+    case MA_CAPT:  pose = f.ov; fr = (f.wf / 3) & 1; break;
+    default:       pose = PO_IDLE; break;
+  }
+}
+
+// ---------- jugador ----------
+static bool mkStartSpecial() {
+  MKFighter &P = mkP;
+  switch (mkSp) {
+    case 1: case 2: case 3:                  // lanza / hielo / escopeta
+      mkCD = MK_CD_FRAMES;
+      P.act = MA_CAST; P.t = 9;
+      mkProjOn = true; mkProjKind = mkSp;
+      mkProjDir = P.right ? 1 : -1;
+      mkProjX = P.x + mkProjDir * 12;
+      return true;
+    case 4:                                  // Liu Kang: salta a la cabeza y patea 3 s
+      mkCD = MK_CD_FRAMES;
+      mkSpState = 1; mkSpT = 0; mkLkX0 = P.x;
+      P.act = MA_BUSY; P.wf = 0;
+      mkE.act = MA_CAPT; mkE.ov = PO_IDLE;
+      return true;
+    case 5:                                  // Raiden / Kung Lao: lanzan el sombrero
+      if (!P.hat && P.id != 8) return false;
+      mkCD = MK_CD_FRAMES;
+      P.hat = false;
+      mkHatFly = true; mkHatBack = false; mkHatHit = false; mkHatFr = 0;
+      mkHatDir = P.right ? 1 : -1;
+      mkHatX = P.x + mkHatDir * 8; mkHatX0 = P.x;
+      P.act = MA_CAST; P.t = 8;
+      return true;
+    case 9:                                  // Sonya: anillos de energia
+      mkCD = MK_CD_FRAMES;
+      P.act = MA_CAST; P.t = 9;
+      mkProjOn = true; mkProjKind = 4;
+      mkProjDir = P.right ? 1 : -1;
+      mkProjX = P.x + mkProjDir * 12;
+      return true;
+    case 7:                                  // Raiden: llueven rayos 5 s sobre el rival
+      mkCD = MK_CD_FRAMES;
+      mkSpState = 1; mkSpT = 0;
+      P.act = MA_CAST; P.t = 999;
+      mkE.act = MA_CAPT; mkE.ov = PO_HIT;
+      return true;
+    case 8:                                  // Kano: bala de canon
+      mkCD = MK_CD_FRAMES;
+      mkSpState = 1; mkSpT = 0;
+      P.act = MA_CAST; P.t = 999;
+      return true;
+    case 6:                                  // Noob: clon de sombra + portales
+      mkCD = MK_CD_FRAMES;
+      mkSpState = 1; mkSpT = 0;
+      P.act = MA_CAST; P.t = 10;
+      return true;
+  }
+  return false;
+}
+
+static void mkPlayerStep() {
+  MKFighter &P = mkP, &E = mkE;
+  if (P.cd > 0) P.cd--;
+  if (mkSpState != 0 && (mkSp == 4 || mkSp == 7 || mkSp == 8)) { P.wf++; return; }    // Liu Kang: animacion controlada por el especial
+  if (P.act == MA_KO || P.act == MA_WIN) return;
+  if (P.act == MA_HIT) { if (--P.t <= 0) P.act = MA_IDLE; return; }
+  if (P.act == MA_CAST) { if (--P.t <= 0) P.act = MA_IDLE; return; }
+  if (P.act == MA_PUNCH || P.act == MA_KICK) { mkAttackStep(0, 1, 7.0f, 11.0f); return; }
+
+  P.right = (E.x > P.x);                                  // siempre mira al rival
+  bool blk = (digitalRead(PIN_R) == LOW) || (digitalRead(PIN_4) == LOW);   // R (o B4) bloquea
+  int jx = getJoyX();
+  float vx = 0;
+  if (jx < 300) vx = P.spd; else if (jx > 700) vx = -P.spd;   // convencion del proyecto: X<300 = derecha
+
+  if (blk) {
+    if (P.act != MA_BLOCK) P.wf = 0; else if (P.wf < 100) P.wf++;
+    P.act = MA_BLOCK; vx = 0;
+  } else {
+    if (P.act == MA_BLOCK) P.act = MA_IDLE;
+    if (P.cd == 0 && digitalRead(PIN_OK) == LOW) { mkStartAttack(0, false); return; }
+    if (P.cd == 0 && digitalRead(PIN_L) == LOW) { mkStartAttack(0, true); return; }       // L = patada
+    if (digitalRead(PIN_3) == LOW && mkCD == 0 && mkSpState == 0 && !mkProjOn && !mkHatFly) {
+      if (mkStartSpecial()) return;
+    }
+  }
+  if (vx != 0) { P.x += vx; P.act = MA_WALK; P.wf++; }
+  else if (P.act != MA_BLOCK) P.act = MA_IDLE;
+
+  if (E.act != MA_CAPT && fabsf(P.x - E.x) < 9) P.x = (P.x < E.x) ? E.x - 9 : E.x + 9;   // no se atraviesan
+  mkClampFighter(0);
+}
+
+// ---------- enemigo (IA) ----------
+static void mkEnemyStep() {
+  MKFighter &E = mkE, &P = mkP;
+  if (E.act == MA_KO || E.act == MA_WIN || E.act == MA_CAPT) { E.wf++; return; }
+  if (mkFrozenT > 0) { E.act = MA_IDLE; return; }           // congelado: no hace nada
+  if (E.act == MA_HIT) { if (--E.t <= 0) E.act = MA_IDLE; return; }
+  if (E.cd > 0) E.cd--;
+  if (E.act == MA_PUNCH || E.act == MA_KICK) {
+    float k = (1.0f + 0.15f * (mkRound - 1)) * mkDiffDmg[mkDiff] / 10.0f;
+    mkAttackStep(1, 0, 6.0f * k, 9.0f * k);
+    if (E.act == MA_IDLE) E.cd = (int16_t)(random(14, 34) * 10.0f / mkDiffCd[mkDiff] / (1.0f + 0.2f * (mkRound - 1)));
+    return;
+  }
+  float d = fabsf(P.x - E.x);
+  if (E.act == MA_BLOCK) { if (E.wf < 100) E.wf++; if (--E.t <= 0) { E.act = MA_IDLE; if (mkDiff >= 2 && E.cd > 4) E.cd = 4; } return; }   // dificil: contraataca al bajar la guardia
+  E.right = (P.x > E.x);
+  float dir = E.right ? 1 : -1;
+
+  bool pAtk = (P.act == MA_PUNCH || P.act == MA_KICK) && d < 22;
+  if (pAtk && random(100) < mkDiffBlk[mkDiff]) { E.act = MA_BLOCK; E.wf = 0; E.t = 10 + random(8); return; }
+
+  float sp = E.spd * mkDiffSpd[mkDiff] / 10.0f;
+  E.act = MA_IDLE;
+  if (d > 14) { E.x += dir * sp; E.act = MA_WALK; E.wf++; }
+  else if (d < 10 && random(100) < mkDiffRet[mkDiff]) { E.x -= dir * sp; E.act = MA_WALK; E.wf++; }
+  if (E.cd == 0 && d <= 17 && P.act != MA_CAPT) {
+    bool kick = (d > 14) || random(100) < 30;
+    mkStartAttack(1, kick);
+  }
+  mkClampFighter(1);
+}
+
+// ---------- especiales ----------
+static void mkHatCheck() {
+  if (mkHatHit || mkE.act == MA_CAPT || mkE.act == MA_KO) return;
+  if (fabsf(mkHatX - mkE.x) < 9) {
+    mkHatHit = true;
+    mkHurt(1, 0, mkE.maxHp * 0.20f, 4, true);   // 20 %
+    mkHatBack = true;
+  }
+}
+
+static void mkSpecialStep() {
+  MKFighter &P = mkP, &E = mkE;
+
+  // --- proyectiles: lanza, hielo, escopeta ---
+  if (mkProjOn) {
+    float sp = (mkProjKind == 1) ? 5.5f : (mkProjKind == 2 ? 3.8f : (mkProjKind == 4 ? 4.6f : 6.5f));
+    mkProjX += mkProjDir * sp;
+    if (mkProjX < -6 || mkProjX > 134) mkProjOn = false;
+    else if (E.act != MA_CAPT && E.act != MA_KO && fabsf(mkProjX - E.x) < 8) {
+      mkProjOn = false;
+      if (mkProjKind == 1) {                              // lanza: 25 % y lo jala hacia Scorpion
+        mkHurt(1, 0, E.maxHp * 0.25f, 0, true);
+        E.x = P.x + mkProjDir * 15; mkClampFighter(1);
+        E.act = MA_HIT; E.t = 14;
+      } else if (mkProjKind == 2) {                       // hielo: congela 3 s
+        mkFrozenT = 90; E.act = MA_IDLE;
+        mkSpark = 5; mkSparkX = (int)E.x; mkSparkY = (int)E.y + 10;
+      } else if (mkProjKind == 4) {                       // anillos: 22 %
+        mkHurt(1, 0, E.maxHp * 0.22f, 7, true);
+      } else {                                            // escopeta: 30 %
+        mkHurt(1, 0, E.maxHp * 0.30f, 6, true);
+      }
+    }
+  }
+  if (mkFrozenT > 0) mkFrozenT--;
+
+  // --- sombrero (Raiden / Kung Lao) ---
+  if (mkHatFly) {
+    mkHatFr++;
+    if (!mkHatBack) {
+      mkHatX += mkHatDir * 4.5f;
+      mkHatCheck();
+      if (fabsf(mkHatX - mkHatX0) > 72 || mkHatX < 4 || mkHatX > 124) mkHatBack = true;
+    } else {
+      float dir = (P.x > mkHatX) ? 1 : -1;
+      mkHatX += dir * 5.0f;
+      mkHatCheck();
+      if (fabsf(mkHatX - P.x) < 6) { mkHatFly = false; P.hat = true; }
+    }
+  }
+
+  // --- Liu Kang: salta a la cabeza, patadas 3 s (25 %), vuelve ---
+  if (mkSp == 4 && mkSpState != 0) {
+    if (mkSpState == 1) {
+      float k = (float)(mkSpT + 1) / 14.0f; if (k > 1) k = 1;
+      P.x = mkLkX0 + (E.x - mkLkX0) * k;
+      P.y = MK_SY - 20 * k - 14 * sinf(3.14159f * k);
+      if (++mkSpT >= 14) { mkSpState = 2; mkSpT = 0; P.x = E.x; P.y = MK_SY - 20; }
+    } else if (mkSpState == 2) {
+      P.x = E.x; P.y = MK_SY - 20;
+      E.act = MA_CAPT; E.ov = PO_HIT;
+      if (mkSpT % 3 == 0) {                                 // 30 patadas = 25 % de vida
+        mkDamageRaw(1, E.maxHp * 0.25f / 30.0f);
+        mkSpark = 3; mkSparkX = (int)E.x + (P.right ? 3 : -3); mkSparkY = (int)E.y + 4;
+      }
+      if (++mkSpT >= 90 || E.hp <= 0) { mkSpState = 3; mkSpT = 0; }
+    } else {
+      float k = (float)(mkSpT + 1) / 14.0f; if (k > 1) k = 1;
+      P.x = E.x + (mkLkX0 - E.x) * k;
+      P.y = MK_SY - 20 + 20 * k - 14 * sinf(3.14159f * k);
+      if (++mkSpT >= 14) {
+        P.x = mkLkX0; P.y = MK_SY; P.act = MA_IDLE; P.cd = 4;
+        E.act = MA_HIT; E.t = 8;
+        mkSpState = 0; mkSpT = 0;
+      }
+    }
+  }
+
+  // --- Raiden: rayos del cielo durante 5 s (30 %) ---
+  if (mkSp == 7 && mkSpState != 0) {
+    P.act = MA_CAST; P.t = 999;
+    E.act = MA_CAPT; E.ov = PO_HIT;
+    if (mkSpT % 6 == 0) {                                   // 25 rayos = 30 % de vida
+      mkBoltX = (int)E.x + (int)random(-7, 8);
+      mkDamageRaw(1, E.maxHp * 0.30f / 25.0f);
+      mkSpark = 3; mkSparkX = (int)E.x; mkSparkY = (int)E.y + 8;
+    }
+    if (++mkSpT >= 167 || E.hp <= 0) {
+      mkSpState = 0; mkSpT = 0; P.act = MA_IDLE; P.t = 0; P.cd = 4;
+      E.act = MA_HIT; E.t = 8;
+    }
+  }
+
+  // --- Kano: se enrolla y rueda hacia el rival (25 %) ---
+  if (mkSp == 8 && mkSpState != 0) {
+    float d = P.right ? 1 : -1;
+    if (mkSpState == 1) {                                   // se agacha
+      P.act = MA_CAST; P.t = 999;
+      if (++mkSpT >= 7) { mkSpState = 2; mkSpT = 0; P.act = MA_IDLE; P.t = 0; }
+    } else {
+      P.x += d * 6.0f; mkSpT++;
+      bool end = false;
+      if (E.act != MA_KO && E.act != MA_CAPT && fabsf(P.x - E.x) < 11) {
+        mkHurt(1, 0, E.maxHp * 0.25f, 9, true);
+        P.x = E.x - d * 11; end = true;
+      } else if (P.x <= 10 || P.x >= 118 || mkSpT > 45) end = true;
+      if (end) {
+        mkClampFighter(0);
+        mkSpState = 0; mkSpT = 0; P.act = MA_IDLE; P.cd = 6;
+      }
+    }
+  }
+
+  // --- Noob: clon, portales, caida infinita, 40 % ---
+  if (mkSp == 6 && mkSpState != 0) {
+    switch (mkSpState) {
+      case 1:                                              // el clon aparece detras del enemigo
+        if (mkSpT == 0) {
+          mkCloneOn = true;
+          mkCloneX = E.x + ((P.x < E.x) ? 16 : -16);
+          if (mkCloneX < 8) mkCloneX = 8;
+          if (mkCloneX > 120) mkCloneX = 120;
+          mkCloneRight = (E.x > mkCloneX);
+          mkClonePose = PO_CAST;
+        }
+        if (++mkSpT >= 12) {
+          mkSpState = 2; mkSpT = 0;
+          mkPortals = true; mkPortalX = E.x; mkPortalR = 2;
+          E.act = MA_CAPT; E.ov = PO_HIT; E.y = MK_SY;
+        }
+        break;
+      case 2:                                              // se abren los portales
+        if (mkPortalR < 12) mkPortalR += 0.8f;
+        if (++mkSpT >= 14) { mkSpState = 3; mkSpT = 0; E.ov = PO_FALL; E.flip = false; }
+        break;
+      case 3:                                              // sube: entra arriba, sale por abajo
+        E.wf++;
+        E.y -= 3.4f;
+        if (E.y + MK_CH <= MK_PT) E.y = MK_GROUND;
+        if (++mkSpT >= 75) { mkSpState = 4; mkSpT = 0; E.flip = true; }
+        break;
+      case 4:                                              // cae: entra abajo, sale por arriba
+        E.wf++;
+        E.y += 3.6f;
+        if (E.y >= MK_GROUND) E.y = MK_PT - MK_CH;
+        if (mkSpT < 75) mkSpT++;
+        if (mkSpT >= 75 && E.y < 28) {                     // a los 5 s, cuando esta arriba, desaparecen
+          mkPortals = false; mkSpState = 5; mkFallV = 3.6f; E.flip = false;
+        }
+        break;
+      case 5:                                              // cae al piso: 40 %
+        mkFallV += 0.6f;
+        E.y += mkFallV;
+        if (E.y >= MK_SY) {
+          E.y = MK_SY;
+          mkDamageRaw(1, E.maxHp * 0.40f);
+          E.act = MA_HIT; E.t = 20;
+          mkSpark = 6; mkSparkX = (int)E.x; mkSparkY = MK_GROUND - 3;
+          mkSpState = 6; mkSpT = 0; mkClonePose = PO_WALK; mkCloneWalk = 0;
+        }
+        break;
+      case 6:                                              // el clon corre hacia el jugador
+        mkCloneRight = (P.x > mkCloneX);
+        mkCloneX += (mkCloneRight ? 1 : -1) * 3.2f;
+        mkCloneWalk++;
+        if (fabsf(mkCloneX - P.x) < 6) { mkSpState = 7; mkSpT = 0; }
+        break;
+      case 7:                                              // y se une a el
+        if (++mkSpT >= 6) { mkCloneOn = false; mkSpState = 0; mkSpT = 0; }
+        break;
+    }
+  }
+}
+
+// ---------- dibujo ----------
+static void mkDotLine(int x0, int y0, int x1, int y1) {   // linea punteada para el fondo
+  int dx = abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
+  int dy = -abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
+  int err = dx + dy;
+  while (true) {
+    if (((x0 + y0) & 1) == 0) display.drawPixel(x0, y0, SSD1306_WHITE);
+    if (x0 == x1 && y0 == y1) break;
+    int e2 = 2 * err;
+    if (e2 >= dy) { err += dy; x0 += sx; }
+    if (e2 <= dx) { err += dx; y0 += sy; }
+  }
+}
+
+static void mkEllipse(int cx, int cy, int rx, int ry) {
+  int px = cx + rx, py = cy;
+  for (int i = 1; i <= 20; i++) {
+    float a = i * 6.28318f / 20.0f;
+    int x = cx + (int)lroundf(rx * cosf(a)), y = cy + (int)lroundf(ry * sinf(a));
+    display.drawLine(px, py, x, y, SSD1306_WHITE);
+    px = x; py = y;
+  }
+}
+
+static void mkDrawBackground() {
+  // luna, montañas punteadas y piso de piedra
+  display.drawCircle(106, 24, 6, SSD1306_WHITE);
+  display.fillCircle(108, 22, 5, SSD1306_BLACK);
+  display.drawCircle(106, 24, 6, SSD1306_WHITE);
+  static const int8_t mx[9] = {0, 16, 30, 48, 64, 82, 98, 114, 127};
+  static const int8_t my[9] = {46, 38, 44, 33, 42, 36, 45, 38, 44};
+  for (int i = 0; i < 8; i++) mkDotLine(mx[i], my[i], mx[i + 1], my[i + 1]);
+  display.drawFastHLine(0, MK_GROUND, 128, SSD1306_WHITE);
+  for (int x = 0; x < 128; x += 8) display.drawFastHLine(x + ((x / 8) & 1) * 3, 62, 4, SSD1306_WHITE);
+}
+
+static void mkDrawHud(bool showTimer) {
+  int pw = (int)(54.0f * mkP.hp / mkP.maxHp);
+  int ew = (int)(54.0f * mkE.hp / mkE.maxHp);
+  display.drawRect(0, 0, 56, 7, SSD1306_WHITE);
+  display.fillRect(1, 1, pw, 5, SSD1306_WHITE);
+  display.drawRect(72, 0, 56, 7, SSD1306_WHITE);
+  display.fillRect(127 - ew, 1, ew, 5, SSD1306_WHITE);
+  if (showTimer) {
+    int s = (int)(mkTimer / 1000.0f + 0.99f); if (s > 60) s = 60; if (s < 0) s = 0;
+    char b[6]; sprintf(b, "%02d", s);
+    display.setTextSize(1); display.setTextColor(SSD1306_WHITE);
+    display.setCursor(58, 0); display.print(b);
+  }
+  for (int i = 0; i < MK_NEED; i++) {                       // rondas ganadas
+    if (i < mkPW) display.fillRect(1 + i * 6, 9, 4, 3, SSD1306_WHITE); else display.drawRect(1 + i * 6, 9, 4, 3, SSD1306_WHITE);
+    if (i < mkEW) display.fillRect(123 - i * 6, 9, 4, 3, SSD1306_WHITE); else display.drawRect(123 - i * 6, 9, 4, 3, SSD1306_WHITE);
+  }
+  // barra del especial (abajo a la izquierda)
+  int w = (mkCD <= 0) ? 40 : (int)(40.0f * (MK_CD_FRAMES - mkCD) / MK_CD_FRAMES);
+  display.fillRect(0, 62, 42, 2, SSD1306_BLACK);
+  if (mkCD <= 0) display.fillRect(1, 62, 40, 2, SSD1306_WHITE);
+  else { display.drawFastHLine(1, 62, 40, SSD1306_WHITE); display.fillRect(1, 62, w, 2, SSD1306_WHITE); }
+}
+
+static void mkDrawFighter(uint8_t fi, bool isEnemy) {
+  MKFighter &f = mkF[fi];
+  uint8_t pose, fr;
+  mkPoseOf(fi, pose, fr);
+  mkBuild(f.id, pose, fr, f.hat);
+  int clipT = 11, clipB = 64;
+  if (isEnemy && mkPortals) { clipT = MK_PT; clipB = MK_GROUND; }
+  int x = (int)f.x;
+  if (!isEnemy && mkSp == 8 && mkSpState == 2) {                            // Kano hecho bola
+    int cy = (int)f.y + 15;
+    display.fillCircle(x, cy, 8, SSD1306_BLACK);
+    display.drawCircle(x, cy, 8, SSD1306_WHITE); display.drawCircle(x, cy, 7, SSD1306_WHITE);
+    float a = mkFrame * 0.9f;
+    display.drawLine(x, cy, x + (int)(6 * cosf(a)), cy + (int)(6 * sinf(a)), SSD1306_WHITE);
+    display.drawLine(x, cy, x - (int)(6 * cosf(a)), cy - (int)(6 * sinf(a)), SSD1306_WHITE);
+    display.fillCircle(x + (int)(4 * cosf(a + 1.6f)), cy + (int)(4 * sinf(a + 1.6f)), 2, SSD1306_WHITE);
+    int d = f.right ? -1 : 1;                                               // estela
+    display.drawFastHLine(x + d * 10, cy - 3, 6, SSD1306_WHITE); display.drawFastHLine(x + d * 12, cy + 2, 8, SSD1306_WHITE);
+    return;
+  }
+  if (isEnemy && mkSp == 4 && mkSpState == 2 && (mkFrame & 1)) x += 1;      // tiembla bajo las patadas
+  mkBlit(x, (int)f.y, f.right, 0, clipT, clipB, f.flip);
+  if (isEnemy && mkFrozenT > 0) {                                           // bloque de hielo
+    int x0 = (int)f.x - 8, y0 = (int)f.y - 1;
+    display.drawRect(x0, y0, 17, 26, SSD1306_WHITE);
+    display.drawLine(x0 + 1, y0 + 6, x0 + 6, y0 + 1, SSD1306_WHITE);
+    display.drawLine(x0 + 10, y0 + 24, x0 + 15, y0 + 19, SSD1306_WHITE);
+    display.drawLine(x0 + 2, y0 + 17, x0 + 4, y0 + 14, SSD1306_WHITE);
+  }
+}
+
+static void mkDrawHatShape(int x, int y, uint8_t fr) {
+  display.fillRect(x - 8, y - 5, 17, 11, SSD1306_BLACK);
+  switch (fr & 3) {
+    case 0: case 2:
+      display.fillRect(x - 6, y - 1, 13, 2, SSD1306_WHITE); display.fillRect(x - 2, y - 3, 5, 2, SSD1306_WHITE); break;
+    case 1:
+      display.fillTriangle(x - 6, y + 2, x + 6, y + 2, x, y - 4, SSD1306_WHITE); break;
+    default:
+      display.fillTriangle(x - 6, y - 3, x + 6, y - 3, x, y + 3, SSD1306_WHITE); break;
+  }
+}
+
+static void mkDrawFanShape(int x, int y, uint8_t fr) {      // abanico girando
+  display.fillRect(x - 8, y - 6, 17, 13, SSD1306_BLACK);
+  float base = (fr & 3) * 1.5708f;
+  int px[5], py[5];
+  for (int k = 0; k < 5; k++) {
+    float a = base - 0.9f + k * 0.45f;
+    px[k] = x + (int)lroundf(7 * cosf(a)); py[k] = y + (int)lroundf(7 * sinf(a));
+    display.drawLine(x, y, px[k], py[k], SSD1306_WHITE);
+    if (k) display.drawLine(px[k - 1], py[k - 1], px[k], py[k], SSD1306_WHITE);
+  }
+}
+
+static void mkDrawEffects() {
+  // portales (encima del enemigo para que parezca que entra/sale)
+  if (mkPortals) {
+    int r = (int)mkPortalR; if (r < 2) r = 2;
+    int px = (int)mkPortalX;
+    mkEllipse(px, MK_PT, r, 3); mkEllipse(px, MK_PT, r > 4 ? r - 4 : 1, 1);
+    mkEllipse(px, MK_GROUND, r, 3); mkEllipse(px, MK_GROUND, r > 4 ? r - 4 : 1, 1);
+  }
+  // clon de Noob: invisible con solo el borde en blanco
+  if (mkCloneOn && !((mkSpState == 1 || mkSpState == 7) && (mkSpT & 1))) {
+    uint8_t fr = (mkClonePose == PO_WALK) ? ((mkCloneWalk / 3) & 3) : 0;
+    mkBuild(mkP.id, mkClonePose, fr, false);
+    mkBlit((int)mkCloneX, MK_SY, mkCloneRight, 1, 0, 64, false);
+  }
+  // Raiden: nubes y rayos
+  if (mkSp == 7 && mkSpState != 0) {
+    for (int c = 0; c < 3; c++) { mkEllipse(40 + c * 24, 15, 10, 3); mkEllipse(46 + c * 24, 13, 6, 2); }
+    if ((mkSpT % 6) < 3) {
+      int tx = (int)mkE.x, x = constrain(mkBoltX, 34, 94), y = 18;
+      int n = 0;
+      while (y < MK_GROUND - 1 && n < 10) {
+        int ny = y + 7, nx = x + ((n & 1) ? 4 : -4);
+        if (ny >= MK_GROUND - 1) { ny = MK_GROUND - 1; nx = tx; }
+        display.drawLine(x, y, nx, ny, SSD1306_WHITE); display.drawLine(x + 1, y, nx + 1, ny, SSD1306_WHITE);
+        x = nx; y = ny; n++;
+      }
+    }
+  }
+  // proyectiles
+  if (mkProjOn) {
+    int y = (int)mkP.y + 12, x = (int)mkProjX, d = (mkProjDir > 0) ? 1 : -1;
+    if (mkProjKind == 1) {
+      display.drawLine((int)mkP.x + d * 10, y, x, y, SSD1306_WHITE);
+      display.fillTriangle(x, y - 3, x, y + 3, x + d * 7, y, SSD1306_WHITE);
+    } else if (mkProjKind == 2) {
+      display.fillCircle(x, y, 3, SSD1306_WHITE);
+      display.drawCircle(x, y, 5, SSD1306_WHITE);
+      display.drawPixel(x - d * 7, y - 2, SSD1306_WHITE); display.drawPixel(x - d * 9, y + 2, SSD1306_WHITE);
+    } else if (mkProjKind == 4) {                                 // anillos de energia
+      mkEllipse(x, y, 3, 6); mkEllipse(x, y, 1, 3);
+      mkEllipse(x - d * 6, y, 2, 4); mkEllipse(x - d * 11, y, 1, 2);
+    } else {
+      display.fillRect(x, y - 2, 3, 1, SSD1306_WHITE); display.fillRect(x - d * 2, y, 3, 1, SSD1306_WHITE);
+      display.fillRect(x, y + 2, 3, 1, SSD1306_WHITE);
+    }
+  }
+  if (mkSp == 3 && mkP.act == MA_CAST && mkP.t >= 7) {                    // fogonazo
+    int d = mkP.right ? 1 : -1, x = (int)mkP.x + d * 16, y = (int)mkP.y + 12;
+    display.drawLine(x - 3, y, x + 3, y, SSD1306_WHITE); display.drawLine(x, y - 3, x, y + 3, SSD1306_WHITE);
+    display.drawLine(x - 2, y - 2, x + 2, y + 2, SSD1306_WHITE); display.drawLine(x - 2, y + 2, x + 2, y - 2, SSD1306_WHITE);
+  }
+  if (mkHatFly) { if (mkP.id == 8) mkDrawFanShape((int)mkHatX, (int)mkP.y + 6, mkHatFr / 2); else mkDrawHatShape((int)mkHatX, (int)mkP.y + 6, mkHatFr / 2); }
+  if (mkSpark > 0) {
+    int x = mkSparkX, y = mkSparkY;
+    display.drawLine(x - 4, y, x + 4, y, SSD1306_WHITE); display.drawLine(x, y - 4, x, y + 4, SSD1306_WHITE);
+    display.drawLine(x - 3, y - 3, x + 3, y + 3, SSD1306_WHITE); display.drawLine(x - 3, y + 3, x + 3, y - 3, SSD1306_WHITE);
+    display.fillRect(x - 1, y - 1, 3, 3, SSD1306_BLACK); display.drawPixel(x, y, SSD1306_WHITE);
+  }
+}
+
+static void mkDrawScene(bool showTimer) {
+  display.clearDisplay();
+  display.setTextSize(1); display.setTextColor(SSD1306_WHITE);
+  mkDrawBackground();
+  mkDrawFighter(1, true);
+  mkDrawFighter(0, false);
+  mkDrawEffects();
+  mkDrawHud(showTimer);
+}
+
+// ---------- pantallas ----------
+static void mkDrawTitle(uint16_t fr) {
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(2);
+  display.setCursor(4, 2);  display.print("MORTAL");
+  display.setCursor(4, 19); display.print("KOMBAT");
+  display.setTextSize(1);
+  // emblema del dragon
+  display.drawCircle(106, 17, 12, SSD1306_WHITE);
+  display.drawCircle(106, 17, 10, SSD1306_WHITE);
+  display.drawLine(99, 12, 108, 10, SSD1306_WHITE); display.drawLine(108, 10, 112, 15, SSD1306_WHITE);
+  display.drawLine(112, 15, 103, 18, SSD1306_WHITE); display.drawLine(103, 18, 108, 24, SSD1306_WHITE);
+  display.drawLine(108, 24, 114, 22, SSD1306_WHITE); display.drawPixel(110, 13, SSD1306_WHITE);
+  // gotas de sangre
+  static const uint8_t gx[6] = {10, 24, 40, 55, 68, 80};
+  static const uint8_t gl[6] = {3, 5, 2, 4, 3, 5};
+  for (int i = 0; i < 6; i++) {
+    int len = gl[i] + (int)((fr / 6 + i) % 3);
+    display.drawFastVLine(gx[i], 35, len, SSD1306_WHITE);
+    display.fillRect(gx[i] - 1, 35 + len, 3, 2, SSD1306_WHITE);
+  }
+  // "Press (1) to start" con el simbolo del boton 1 como en la prueba de botones
+  display.setCursor(13, 53); display.print("Press ");
+  bool blink = ((fr / 15) & 1);
+  if (blink) { display.fillCircle(54, 56, 6, SSD1306_WHITE); display.setTextColor(SSD1306_BLACK); }
+  else display.drawCircle(54, 56, 6, SSD1306_WHITE);
+  display.setCursor(52, 53); display.print("1");
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(63, 53); display.print(" to start");
+  flushScreen();
+}
+
+static void mkDrawSelect() {
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE); display.setTextSize(1);
+  display.setCursor(2, 1); display.print("SELECT FIGHTER");
+  display.drawFastHLine(0, 10, 128, SSD1306_WHITE);
+  display.drawFastVLine(72, 10, 54, SSD1306_WHITE);
+  int top = mkSel - 2; if (top < 0) top = 0; if (top > MK_NUM - 6) top = MK_NUM - 6;
+  for (int r = 0; r < 6; r++) {
+    int i = top + r, y = 13 + r * 8;
+    if (i == mkSel) { display.fillRect(0, y - 1, 72, 9, SSD1306_WHITE); display.setTextColor(SSD1306_BLACK); }
+    else display.setTextColor(SSD1306_WHITE);
+    display.setCursor(3, y); display.print(mkNames[i]);
+  }
+  if (top > 0) display.fillTriangle(68, 14, 64, 14, 66, 11, SSD1306_WHITE);
+  if (top < MK_NUM - 6) display.fillTriangle(68, 61, 64, 61, 66, 64, SSD1306_WHITE);
+  display.setTextColor(SSD1306_WHITE);
+  bool hat = (mkSel == 3 || mkSel == 4);
+  mkBuild(mkSel, PO_IDLE, 0, hat);
+  mkBlit(100, 13, true, 0, 0, 64, false);
+  const char* sp = mkSpName[mkSel];
+  int w = (int)strlen(sp) * 6;
+  display.setCursor(73 + (55 - w) / 2, 40); display.print(sp);
+  display.drawRect(76, 51, 48, 4, SSD1306_WHITE);
+  display.fillRect(77, 52, (int)(46.0f * mkHpTab[mkSel] / 130.0f), 2, SSD1306_WHITE);
+  display.drawRect(76, 58, 48, 4, SSD1306_WHITE);
+  display.fillRect(77, 59, (int)(46.0f * mkSpdTab[mkSel] / 24.0f), 2, SSD1306_WHITE);
+  flushScreen();
+}
+
+static void mkDrawDifficulty() {
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE); display.setTextSize(1);
+  display.setCursor(2, 1); display.print("DIFFICULTY");
+  display.drawFastHLine(0, 10, 128, SSD1306_WHITE);
+  for (int i = 0; i < 4; i++) {
+    int y = 14 + i * 12;
+    bool on = (i == mkDiff);
+    if (on) { display.fillRect(0, y - 2, 128, 11, SSD1306_WHITE); display.setTextColor(SSD1306_BLACK); }
+    else display.setTextColor(SSD1306_WHITE);
+    display.setCursor(8, y); display.print(mkDiffName[i]);
+    for (int j = 0; j < 4; j++) {                           // nivel de amenaza
+      int x = 92 + j * 8;
+      uint16_t c = on ? SSD1306_BLACK : SSD1306_WHITE;
+      if (j <= i) display.fillRect(x, y, 5, 6, c); else display.drawRect(x, y, 5, 6, c);
+    }
+  }
+  display.setTextColor(SSD1306_WHITE);
+  flushScreen();
+}
+
+// Pausa: devuelve true si el jugador decide salir del juego
+static bool mkPause() {
+  mkWaitRelease(PIN_ESC);
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.drawRect(14, 8, 100, 48, SSD1306_WHITE);
+  mkCenter("PAUSE", 14, 2);
+  display.setTextSize(1);
+  display.setCursor(24, 36); display.print("OK  : resume");
+  display.setCursor(24, 46); display.print("ESC : exit game");
+  flushScreen();
+  delay(200);
+  while (true) {
+    if (digitalRead(PIN_OK) == LOW) { mkWaitRelease(PIN_OK); return false; }
+    if (digitalRead(PIN_ESC) == LOW) { mkWaitRelease(PIN_ESC); return true; }
+    delay(10);
+  }
+}
+
+static void mkStartMatch() {
+  mkInitFighter(0, mkSel);
+  uint8_t e = random(MK_NUM - 1);
+  if (e >= mkSel) e++;
+  mkInitFighter(1, e);
+  mkF[1].maxHp = mkF[1].maxHp * mkDiffHp[mkDiff] / 100.0f;
+  mkSp = mkSpType[mkSel];
+  mkRound = 1; mkPW = 0; mkEW = 0;
+  mkInitRound();
+}
+
+void runMortalKombat() {
+  uint8_t state = MKS_MENU;
+  int16_t stT = 0;
+  bool winnerP = true, timeUp = false, flawless = false;
+  unsigned long last = millis();
+  uint16_t fr = 0;
+  delay(250);
+
+  while (true) {
+    while (millis() - last < 30) delay(1);
+    last = millis();
+    fr++; mkFrame++;
+
+    // ESC durante la partida abre la pausa (con opcion de salir)
+    if ((state == MKS_INTRO || state == MKS_FIGHT || state == MKS_FINISH || state == MKS_KO || state == MKS_ROUND)
+        && digitalRead(PIN_ESC) == LOW) {
+      if (mkPause()) { delay(250); return; }
+      last = millis();
+      continue;
+    }
+
+    switch (state) {
+      case MKS_MENU:
+        mkDrawTitle(fr);
+        if (digitalRead(PIN_OK) == LOW) { mkWaitRelease(PIN_OK); state = MKS_SELECT; stT = 0; }
+        if (digitalRead(PIN_ESC) == LOW) { mkWaitRelease(PIN_ESC); delay(250); return; }
+        break;
+
+      case MKS_SELECT: {
+        mkDrawSelect();
+        int vy = getJoyY();
+        if (stT > 0) stT--;
+        if (stT == 0) {
+          if (vy < 300) { mkSel = (mkSel + 1) % MK_NUM; stT = 5; }
+          else if (vy > 700) { mkSel = (mkSel + MK_NUM - 1) % MK_NUM; stT = 5; }
+        }
+        if (digitalRead(PIN_OK) == LOW) { mkWaitRelease(PIN_OK); state = MKS_DIFF; stT = 0; }
+        if (digitalRead(PIN_ESC) == LOW) { mkWaitRelease(PIN_ESC); state = MKS_MENU; }
+        break;
+      }
+
+      case MKS_DIFF: {
+        mkDrawDifficulty();
+        int vy = getJoyY();
+        if (stT > 0) stT--;
+        if (stT == 0) {
+          if (vy < 300) { mkDiff = (mkDiff + 1) % 4; stT = 5; }
+          else if (vy > 700) { mkDiff = (mkDiff + 3) % 4; stT = 5; }
+        }
+        if (digitalRead(PIN_OK) == LOW) {
+          mkWaitRelease(PIN_OK);
+          mkStartMatch();
+          state = MKS_INTRO; stT = 0;
+        }
+        if (digitalRead(PIN_ESC) == LOW) { mkWaitRelease(PIN_ESC); state = MKS_SELECT; stT = 0; }
+        break;
+      }
+
+      case MKS_INTRO: {
+        mkDrawScene(true);
+        display.setTextColor(SSD1306_WHITE);
+        if (stT < 40) {
+          char b[12]; sprintf(b, "ROUND %d", mkRound);
+          mkCenter(b, 20, 2);
+          if (mkRound == 1) {
+            display.setTextSize(1);
+            display.setCursor(1, 13); display.print(mkNames[mkP.id]);
+            const char* en = mkNames[mkE.id];
+            display.setCursor(127 - 6 * (int)strlen(en), 13); display.print(en);
+            mkCenter(mkDiffName[mkDiff], 44, 1);
+          }
+        } else {
+          mkCenter("FIGHT!", 20, 2);
+        }
+        flushScreen();
+        if (++stT >= 70) { state = MKS_FIGHT; stT = 0; }
+        break;
+      }
+
+      case MKS_FIGHT: {
+        mkPlayerStep();
+        mkEnemyStep();
+        mkSpecialStep();
+        if (mkCD > 0) mkCD--;
+        if (mkSpark > 0) mkSpark--;
+        mkTimer -= 30;
+        mkDrawScene(true);
+        flushScreen();
+
+        bool pDead = (mkP.hp <= 0), eDead = (mkE.hp <= 0);
+        timeUp = (mkTimer <= 0);
+        if (pDead || eDead || timeUp) {
+          if (pDead && eDead) winnerP = true;
+          else if (eDead) winnerP = true;
+          else if (pDead) winnerP = false;
+          else winnerP = (mkP.hp / mkP.maxHp >= mkE.hp / mkE.maxHp);
+          mkCancelSpecial();
+          if (winnerP) mkPW++; else mkEW++;
+          flawless = winnerP ? !mkP.damaged : !mkE.damaged;
+          bool matchOver = (mkPW >= MK_NEED || mkEW >= MK_NEED);
+          if (matchOver && winnerP && !timeUp) {
+            state = MKS_FINISH;
+            mkE.act = MA_HIT; mkE.t = 120; mkP.act = MA_IDLE;
+          } else {
+            state = MKS_KO;
+            uint8_t li = winnerP ? 1 : 0, wi = winnerP ? 0 : 1;
+            mkF[li].act = MA_KO; mkF[li].x += (mkF[li].x >= mkF[wi].x) ? 8 : -8; mkClampFighter(li);
+            mkF[wi].act = MA_WIN;
+          }
+          stT = 0;
+        }
+        break;
+      }
+
+      case MKS_FINISH:
+        mkE.t = 120;
+        mkDrawScene(false);
+        display.setTextColor(SSD1306_WHITE);
+        if ((stT / 5) & 1) mkCenter("FINISH HIM!", 22, 1);
+        flushScreen();
+        if (++stT >= 40) {
+          state = MKS_KO; stT = 0;
+          mkE.act = MA_KO; mkE.x += (mkE.x >= mkP.x) ? 8 : -8; mkClampFighter(1);
+          mkP.act = MA_WIN;
+        }
+        break;
+
+      case MKS_KO:
+        mkDrawScene(false);
+        display.setTextColor(SSD1306_WHITE);
+        mkCenter(timeUp ? "TIME UP" : "K.O.", 18, 2);
+        flushScreen();
+        if (++stT >= 50) { state = MKS_ROUND; stT = 0; }
+        break;
+
+      case MKS_ROUND: {
+        mkDrawScene(false);
+        display.setTextColor(SSD1306_WHITE);
+        char b[20]; sprintf(b, "%s WINS", mkNames[winnerP ? mkP.id : mkE.id]);
+        display.fillRect(0, 14, 128, flawless ? 28 : 18, SSD1306_BLACK);
+        mkCenter(b, 17, 1);
+        if (flawless) mkCenter("FLAWLESS VICTORY", 29, 1);
+        flushScreen();
+        if (++stT >= 60) {
+          if (mkPW >= MK_NEED) { state = MKS_WIN; stT = 0; }
+          else if (mkEW >= MK_NEED) { state = MKS_LOSE; stT = 0; }
+          else { mkRound++; mkInitRound(); state = MKS_INTRO; stT = 0; }
+        }
+        break;
+      }
+
+      case MKS_WIN: {
+        display.clearDisplay();
+        display.setTextColor(SSD1306_WHITE);
+        display.setTextSize(2);
+        display.setCursor(4, 6); display.print("YOU WIN");
+        display.setTextSize(1);
+        display.setCursor(4, 28); display.print(mkNames[mkP.id]);
+        display.setCursor(4, 40); display.print("OK: continue");
+        mkBuild(mkP.id, PO_WIN, 0, mkP.id == 3 || mkP.id == 4);
+        mkBlit(104, 24, true, 0, 0, 64, false);
+        display.drawFastHLine(0, 50, 128, SSD1306_WHITE);
+        flushScreen();
+        if (digitalRead(PIN_OK) == LOW) { mkWaitRelease(PIN_OK); state = MKS_MENU; }
+        if (digitalRead(PIN_ESC) == LOW) { mkWaitRelease(PIN_ESC); delay(250); return; }
+        if (++stT > 300) state = MKS_MENU;
+        break;
+      }
+
+      case MKS_LOSE: {
+        int cnt = 9 - stT / 33;
+        display.clearDisplay();
+        display.setTextColor(SSD1306_WHITE);
+        mkCenter("CONTINUE?", 4, 1);
+        char b[8]; sprintf(b, "%d", cnt < 0 ? 0 : cnt);
+        mkCenter(b, 18, 4);
+        mkCenter("OK: yes   ESC: no", 54, 1);
+        flushScreen();
+        if (digitalRead(PIN_OK) == LOW) { mkWaitRelease(PIN_OK); state = MKS_SELECT; stT = 0; break; }
+        if (digitalRead(PIN_ESC) == LOW) { mkWaitRelease(PIN_ESC); state = MKS_MENU; stT = 0; break; }
+        if (++stT >= 33 * 10) { state = MKS_MENU; stT = 0; }
+        break;
+      }
+    }
+  }
+}
+
+// ===================== MENÚ DE JUEGOS =====================
+void runGames() {
+  const char* names[] = {"Snake", "Dino Run", "Breakout", "Flappy Bird", "Mortal Kombat"};
+  const int NUM_GAMES = 5;
+  int8_t sel = 0;
+  unsigned long lastMove = 0;
+  delay(300);
+
+  while (digitalRead(PIN_ESC) == HIGH) {
+    int vy = getJoyY();
+    if (millis() - lastMove > 180) {
+      if (vy > 700)      { sel = (sel + NUM_GAMES - 1) % NUM_GAMES; lastMove = millis(); }
+      else if (vy < 300) { sel = (sel + 1) % NUM_GAMES; lastMove = millis(); }
+    }
+
+    drawMenu(isEnglish ? "GAMES" : "JUEGOS", names, NUM_GAMES, sel);
+    flushScreen();
+
+    if (digitalRead(PIN_OK) == LOW) {
+      delay(250);
+      switch (sel) {
+        case 0: runSnake(); break;
+        case 1: runDino(); break;
+        case 2: runBreakout(); break;
+        case 3: runFlappy(); break;
+        case 4: runMortalKombat(); break;
+      }
+      while (digitalRead(PIN_ESC) == LOW) delay(10);
+      delay(200);
+      lastMove = millis();
+    }
+  }
+  currentApp = -1;
+  delay(300);
+}
+
+void runProximamente() {
+  while(digitalRead(PIN_ESC) == HIGH) {
+    display.clearDisplay();
+    display.setCursor(isEnglish ? 22 : 20, 25);
+    display.setTextSize(1);
+    display.print(isEnglish ? F("COMING SOON...") : F("PROXIMAMENTE..."));
+    flushScreen();
+  }
+  currentApp = -1; delay(300);
+}
+
+// ===================== CALCULADORA =====================
+// ---- Evaluador de expresiones: + - * / ^ % ( ) pi e ans sin cos tan sqrt ln log abs exp ----
+static const char* cpP;
+static bool cpErr;
+static bool cDeg = true;          // true = grados, false = radianes
+static double cAns = 0;
+
+static double cpExpr();
+static double cpUnary();
+static void cpSkip() { while (*cpP == ' ') cpP++; }
+
+static double cpPrimary() {
+  cpSkip();
+  char c = *cpP;
+  double v = 0;
+  if (c == '(') {                                   // el parentesis sin cerrar se perdona
+    cpP++; v = cpExpr(); cpSkip(); if (*cpP == ')') cpP++;
+  } else if ((c >= '0' && c <= '9') || c == '.') {
+    char* e; v = strtod(cpP, &e);
+    if (e == cpP) { cpErr = true; return 0; }
+    cpP = e;
+  } else if (c >= 'a' && c <= 'z') {
+    char nm[8]; uint8_t n = 0;
+    while (*cpP >= 'a' && *cpP <= 'z' && n < 7) nm[n++] = *cpP++;
+    nm[n] = 0;
+    if (!strcmp(nm, "pi")) v = 3.14159265358979;
+    else if (!strcmp(nm, "e")) v = 2.71828182845905;
+    else if (!strcmp(nm, "ans")) v = cAns;
+    else {
+      cpSkip();
+      if (*cpP != '(') { cpErr = true; return 0; }
+      cpP++; double a = cpExpr(); cpSkip(); if (*cpP == ')') cpP++;
+      double k = cDeg ? 0.017453292519943295 : 1.0;
+      if (!strcmp(nm, "sin")) v = sin(a * k);
+      else if (!strcmp(nm, "cos")) v = cos(a * k);
+      else if (!strcmp(nm, "tan")) v = tan(a * k);
+      else if (!strcmp(nm, "sqrt")) { if (a < 0) { cpErr = true; return 0; } v = sqrt(a); }
+      else if (!strcmp(nm, "ln")) { if (a <= 0) { cpErr = true; return 0; } v = log(a); }
+      else if (!strcmp(nm, "log")) { if (a <= 0) { cpErr = true; return 0; } v = log10(a); }
+      else if (!strcmp(nm, "abs")) v = fabs(a);
+      else if (!strcmp(nm, "exp")) v = exp(a);
+      else { cpErr = true; return 0; }
+    }
+  } else { cpErr = true; return 0; }
+  cpSkip();
+  while (*cpP == '%') { v /= 100.0; cpP++; cpSkip(); }
+  return v;
+}
+
+static double cpPow() {
+  double b = cpPrimary();
+  cpSkip();
+  if (*cpP == '^') { cpP++; double e = cpUnary(); return pow(b, e); }
+  return b;
+}
+
+static double cpUnary() {
+  cpSkip();
+  if (*cpP == '-') { cpP++; return -cpUnary(); }
+  if (*cpP == '+') { cpP++; return cpUnary(); }
+  return cpPow();
+}
+
+static double cpTerm() {
+  double v = cpUnary();
+  for (;;) {
+    cpSkip(); char c = *cpP;
+    if (c == '*') { cpP++; v *= cpUnary(); }
+    else if (c == '/') { cpP++; double d = cpUnary(); if (d == 0) { cpErr = true; return 0; } v /= d; }
+    else if (c == '(' || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '.') v *= cpPow();   // 2(3), 2pi, 3sin(30)
+    else break;
+    if (cpErr) return 0;
+  }
+  return v;
+}
+
+static double cpExpr() {
+  double v = cpTerm();
+  for (;;) {
+    cpSkip(); char c = *cpP;
+    if (c == '+') { cpP++; v += cpTerm(); }
+    else if (c == '-') { cpP++; v -= cpTerm(); }
+    else break;
+    if (cpErr) return 0;
+  }
+  return v;
+}
+
+static bool calcEval(const char* e, double* out) {
+  cpP = e; cpErr = false;
+  double v = cpExpr();
+  cpSkip();
+  if (*cpP != 0) cpErr = true;
+  if (cpErr || v != v || fabs(v) > 1e300) return false;       // NaN o infinito
+  *out = v;
+  return true;
+}
+
+static void calcFmt(double v, char* b) {            // b >= 24
+  if (fabs(v) < 1e-12) v = 0;
+  snprintf(b, 24, "%.10g", v);
+}
+
+static bool calcIsOpCh(char c) { return c == '+' || c == '-' || c == '*' || c == '/' || c == '^' || c == '%'; }
+
+// Inserta un trozo en la expresion con las reglas de multiplicacion implicita
+static void calcInsert(char* e, const char* tok, bool* just) {
+  char t0 = tok[0];
+  if (*just) {
+    if (!calcIsOpCh(t0)) e[0] = 0;                  // tras un resultado, un numero empieza de cero
+    *just = false;
+  }
+  size_t n = strlen(e);
+  if (n == 0 && (t0 == '*' || t0 == '/' || t0 == '^' || t0 == '%')) { strcpy(e, "ans"); n = 3; }
+  if (n + strlen(tok) + 2 > 58) return;
+  char last = n ? e[n - 1] : 0;
+  bool lastLetter = (last >= 'a' && last <= 'z');
+  bool tokLetter = (t0 >= 'a' && t0 <= 'z');
+  bool tokDigit = (t0 >= '0' && t0 <= '9') || t0 == '.';
+  if (tokLetter && (lastLetter || (last >= '0' && last <= '9') || last == '.' || last == ')')) { e[n++] = '*'; e[n] = 0; }
+  else if (tokDigit && (lastLetter || last == ')')) { e[n++] = '*'; e[n] = 0; }
+  strcat(e, tok);
+}
+
+static void calcBack(char* e) {
+  size_t n = strlen(e);
+  if (!n) return;
+  char c = e[n - 1];
+  if (c == '(') {                                    // borra "sin(" completo
+    n--; while (n > 0 && e[n - 1] >= 'a' && e[n - 1] <= 'z') n--;
+  } else if (c >= 'a' && c <= 'z') {                 // borra "pi", "ans"...
+    while (n > 0 && e[n - 1] >= 'a' && e[n - 1] <= 'z') n--;
+  } else n--;
+  e[n] = 0;
+}
+
+void runFullCalc() {
+  struct CK { const char* lab; const char* ins; };
+  static const CK pg[2][24] = {
+    {
+      {"7","7"},{"8","8"},{"9","9"},{"/","/"},{"C","@C"},{"<","@B"},
+      {"4","4"},{"5","5"},{"6","6"},{"*","*"},{"(","("},{")",")"},
+      {"1","1"},{"2","2"},{"3","3"},{"-","-"},{"ANS","ans"},{"fn","@F"},
+      {"0","0"},{".","."},{"=","@="},{"+","+"},{"%","%"},{"^","^"}
+    }, {
+      {"sin","sin("},{"cos","cos("},{"tan","tan("},{"sq","sqrt("},{"C","@C"},{"<","@B"},
+      {"ln","ln("},{"log","log("},{"x2","^2"},{"1/x","1/("},{"(","("},{")",")"},
+      {"pi","pi"},{"e","e"},{"abs","abs("},{"exp","exp("},{"ANS","ans"},{"123","@F"},
+      {"0","0"},{".","."},{"=","@="},{"+","+"},{"%","%"},{"DEG","@D"}
+    }
+  };
+  char expr[64] = "";         // lo que se esta escribiendo
+  char last[64] = "";         // expresion anterior (se muestra al dar =)
+  char res[24] = "";          // resultado o vista previa
+  bool just = false;          // acaba de darse "="
+  bool err = false;
+  uint8_t page = 0; int8_t kx = 0, ky = 0;
+  bool dirty = true;
+  unsigned long lastMove = 0, lastOk = 0;
+  delay(200);
+
+  while (digitalRead(PIN_ESC) == HIGH) {
+    if (dirty) {                                      // vista previa en vivo
+      dirty = false; res[0] = 0;
+      if (!just && !err && expr[0]) {
+        double v;
+        bool complex = (expr[0] < '0' || expr[0] > '9') && expr[0] != '.';
+        if (!complex) for (const char* q = expr; *q; q++) if (!((*q >= '0' && *q <= '9') || *q == '.')) { complex = true; break; }
+        if (complex && calcEval(expr, &v)) calcFmt(v, res);
+      }
+    }
+
+    display.clearDisplay(); display.setTextSize(1); display.setTextColor(SSD1306_WHITE);
+    display.drawRoundRect(0, 0, 128, 18, 3, SSD1306_WHITE);
+    {
+      char line1[64]; const char* src = just ? last : expr;
+      size_t sl = strlen(src); size_t from = sl > 19 ? sl - 19 : 0;
+      size_t j = 0; if (from > 0) line1[j++] = '<';
+      for (size_t i = from + (from > 0 ? 1 : 0); i < sl && j < 62; i++) line1[j++] = (src[i] == '*') ? 'x' : src[i];
+      if (just && j < 62) line1[j++] = '=';
+      line1[j] = 0;
+      display.setCursor(124 - (int)strlen(line1) * 6, 2); display.print(line1);
+      const char* l2 = err ? "Error" : (just ? expr : res);
+      display.setCursor(124 - (int)strlen(l2) * 6, 10); display.print(l2);
+    }
+
+    int vx = getJoyX(), vy = getJoyY();
+    if (millis() - lastMove > 140) {
+      if (vx < 300) { kx = (kx + 1) % 6; lastMove = millis(); }
+      else if (vx > 700) { kx = (kx + 5) % 6; lastMove = millis(); }
+      if (vy < 300) { ky = (ky + 1) % 4; lastMove = millis(); }
+      else if (vy > 700) { ky = (ky + 3) % 4; lastMove = millis(); }
+    }
+
+    for (uint8_t i = 0; i < 24; i++) {
+      uint8_t r = i / 6, c = i % 6;
+      int x = 1 + c * 21, y = 20 + r * 11;
+      bool on = (ky == r && kx == c);
+      uint16_t fg = on ? SSD1306_BLACK : SSD1306_WHITE;
+      if (on) display.fillRoundRect(x, y, 20, 10, 2, SSD1306_WHITE); else display.drawRoundRect(x, y, 20, 10, 2, SSD1306_WHITE);
+      display.setTextColor(fg);
+      const char* lb = pg[page][i].lab;
+      int cx = x + 10, cy = y + 5;
+      if (!strcmp(lb, "/")) {                         // simbolo de division
+        display.drawFastHLine(cx - 4, cy, 9, fg); display.fillRect(cx - 1, cy - 3, 2, 2, fg); display.fillRect(cx - 1, cy + 2, 2, 2, fg);
+      } else if (!strcmp(lb, "*")) {
+        display.drawLine(cx - 3, cy - 3, cx + 3, cy + 3, fg); display.drawLine(cx - 3, cy + 3, cx + 3, cy - 3, fg);
+        display.drawLine(cx - 2, cy - 3, cx + 4, cy + 3, fg); display.drawLine(cx - 2, cy + 3, cx + 4, cy - 3, fg);
+      } else if (!strcmp(lb, "+")) { display.drawFastHLine(cx - 3, cy, 7, fg); display.drawFastVLine(cx, cy - 3, 7, fg); }
+      else if (!strcmp(lb, "-")) { display.drawFastHLine(cx - 3, cy, 7, fg); }
+      else if (!strcmp(lb, "=")) { display.drawFastHLine(cx - 3, cy - 2, 7, fg); display.drawFastHLine(cx - 3, cy + 1, 7, fg); }
+      else if (!strcmp(lb, ".")) { display.fillRect(cx - 1, cy + 1, 2, 2, fg); }
+      else if (!strcmp(lb, "<")) { display.drawFastHLine(cx - 5, cy, 11, fg); display.drawLine(cx - 5, cy, cx - 2, cy - 3, fg); display.drawLine(cx - 5, cy, cx - 2, cy + 3, fg); }
+      else if (!strcmp(lb, "sq")) {                   // raiz cuadrada
+        display.drawLine(cx - 5, cy + 1, cx - 3, cy + 3, fg); display.drawLine(cx - 3, cy + 3, cx - 1, cy - 3, fg); display.drawFastHLine(cx - 1, cy - 3, 7, fg);
+      } else if (!strcmp(lb, "x2")) {
+        display.setCursor(cx - 5, y + 2); display.print('x'); display.setCursor(cx + 1, y + 1); display.print('2');
+      } else if (!strcmp(lb, "pi")) {
+        display.drawFastHLine(cx - 4, cy - 2, 9, fg); display.drawFastVLine(cx - 2, cy - 2, 6, fg); display.drawLine(cx + 2, cy - 2, cx + 2, cy + 3, fg); display.drawPixel(cx + 3, cy + 3, fg);
+      } else {
+        const char* t = !strcmp(lb, "DEG") ? (cDeg ? "DEG" : "RAD") : lb;
+        display.setCursor(cx - (int)strlen(t) * 3 + 1, y + 1); display.print(t);
+      }
+    }
+    display.setTextColor(SSD1306_WHITE);
+
+    if (digitalRead(PIN_OK) == LOW && millis() - lastOk > 190) {
+      lastOk = millis();
+      const char* ins = pg[page][ky * 6 + kx].ins;
+      if (err && ins[0] != '@') { err = false; expr[0] = 0; just = false; }
+      if (ins[0] == '@') {
+        switch (ins[1]) {
+          case 'C': expr[0] = 0; last[0] = 0; just = false; err = false; break;
+          case 'B': if (just) { expr[0] = 0; just = false; } else calcBack(expr); err = false; break;
+          case 'F': page ^= 1; break;
+          case 'D': cDeg = !cDeg; break;
+          case '=': {
+            double v;
+            if (expr[0] && !just) {
+              if (calcEval(expr, &v)) {
+                strcpy(last, expr); cAns = v; calcFmt(v, expr); just = true; err = false;
+              } else err = true;
+            }
+          } break;
+        }
+      } else calcInsert(expr, ins, &just);
+      dirty = true;
+    }
+    flushScreen();
+  }
+  currentApp = -1;
+  delay(300);
+}
+
+// ===================== TIMER =====================
+// ===================== RELOJ / CRONOMETRO / ALARMA =====================
+#define PIN_BUZZER -1   // pon aqui el pin de un buzzer activo si algun dia le conectas uno
+
+bool clock24 = true;            // true = 24 h, false = 12 h
+long tzOffset = 0;              // segundos respecto a UTC
+bool tzAuto = true, tzDone = false, timeManual = false;
+uint8_t alMode = 0;             // 0 apagada, 1 "en 1 minuto" (usa millis), 2 a una hora (usa el reloj)
+unsigned long alAtMs = 0;
+time_t alAtEpoch = 0;
+int alH = 7, alM = 0;
+bool alarmBusy = false;
+bool swRun = false; unsigned long swStart = 0, swEl = 0;
+bool clockFmtDone = false;      // ya se pregunto 12/24 h
+int alDH = 0, alDM = 1, alDS = 0;   // ultima duracion usada
+
+void clockSave() {
+  Preferences p; p.begin("clock", false);
+  p.putBool("f24", clock24); p.putLong("tz", tzOffset); p.putBool("tza", tzAuto); p.putBool("fmt", clockFmtDone);
+  p.end();
+}
+
+void ntpKick() { configTime(0, 0, "pool.ntp.org", "time.google.com", "time.nist.gov"); }
+
+void clockInit() {
+  Preferences p; p.begin("clock", true);
+  clock24 = p.getBool("f24", true); tzOffset = p.getLong("tz", 0); tzAuto = p.getBool("tza", true); clockFmtDone = p.getBool("fmt", false);
+  p.end();
+  ntpKick();
+#if PIN_BUZZER >= 0
+  pinMode(PIN_BUZZER, OUTPUT); digitalWrite(PIN_BUZZER, LOW);
+#endif
+}
+
+bool timeIsValid() { return time(nullptr) > 1700000000L; }
+
+void getLocal(struct tm* o) { time_t t = time(nullptr) + tzOffset; gmtime_r(&t, o); }
+
+bool fetchTimezone() {
+  if (WiFi.status() != WL_CONNECTED) return false;
+  WiFiClient cl; HTTPClient http; http.setTimeout(4000);
+  if (!http.begin(cl, "http://ip-api.com/json/?fields=status,offset")) return false;
+  bool ok = false;
+  if (http.GET() == 200) {
+    String body = http.getString();
+    int i = body.indexOf("\"offset\":");
+    if (i >= 0) { tzOffset = body.substring(i + 9).toInt(); ok = true; }
+  }
+  http.end();
+  return ok;
+}
+
+long daysFromCivil(long y, int m, int d) {
+  if (m <= 2) y--;
+  long era = (y >= 0 ? y : y - 399) / 400;
+  long yoe = y - era * 400;
+  long doy = (153L * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+  long doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+  return era * 146097L + doe - 719468L;
+}
+
+void setManualTime(int y, int mo, int d, int h, int mi) {
+  long e = daysFromCivil(y, mo, d) * 86400L + h * 3600L + mi * 60L - tzOffset;
+  struct timeval tv; tv.tv_sec = e; tv.tv_usec = 0;
+  settimeofday(&tv, NULL);
+  timeManual = true;
+}
+
+const char* hourStr(char* b, int h, int m) {   // b >= 8 bytes; devuelve "", "AM" o "PM"
+  if (clock24) { snprintf(b, 8, "%02d:%02d", h, m); return ""; }
+  int h12 = h % 12; if (h12 == 0) h12 = 12;
+  snprintf(b, 8, "%d:%02d", h12, m);
+  return h >= 12 ? "PM" : "AM";
+}
+
+void waitEsc() { while (digitalRead(PIN_ESC) == LOW) delay(10); delay(120); }
+
+void clockMsg(const char* a, const char* b, int ms) {
+  display.clearDisplay(); display.drawRect(0, 0, 128, 64, SSD1306_WHITE);
+  display.setTextSize(1); display.setTextColor(SSD1306_WHITE);
+  display.setCursor(64 - strlen(a) * 3, 22); display.print(a);
+  display.setCursor(64 - strlen(b) * 3, 36); display.print(b);
+  flushScreen(); delay(ms);
+}
+
+// ---------- ALARMA ----------
+void alarmRing(uint8_t kind) {
+  alarmBusy = true;
+  uint8_t* bk = (uint8_t*)malloc(1024);
+  if (bk) memcpy(bk, display.getBuffer(), 1024);
+  while (digitalRead(PIN_OK) == LOW) delay(10);
+  delay(600);                                   // evita que un pulso de otra app la quite al instante
+  unsigned long t0 = millis();
+  bool done = false;
+  while (!done) {
+    bool fl = ((millis() - t0) / 350) % 2;
+    uint16_t fg = fl ? SSD1306_BLACK : SSD1306_WHITE;
+    display.clearDisplay();
+    if (fl) display.fillRect(0, 0, 128, 64, SSD1306_WHITE);
+    else { display.drawRect(0, 0, 128, 64, SSD1306_WHITE); display.drawRect(2, 2, 124, 60, SSD1306_WHITE); }
+    display.setTextColor(fg);
+    display.setTextSize(2); display.setCursor(isEnglish ? 28 : 22, 7);
+    display.print(isEnglish ? F("ALARM!") : F("ALARMA!"));
+    display.setTextSize(1);
+    const char* m = kind == 1 ? (isEnglish ? "One minute is up!" : "Ya paso el minuto!")
+                              : (isEnglish ? "It's time!" : "Ya es la hora!");
+    display.setCursor(64 - strlen(m) * 3, 27); display.print(m);
+    display.setCursor(12, 46); display.print(isEnglish ? F("Press") : F("Pulsa"));
+    display.drawCircle(58, 49, 6, fg);
+    display.setCursor(56, 46); display.print(F("1"));
+    display.setCursor(70, 46); display.print(isEnglish ? F("to stop") : F("parar"));
+    flushScreen();
+#if PIN_BUZZER >= 0
+    digitalWrite(PIN_BUZZER, fl ? HIGH : LOW);
+#endif
+    if (digitalRead(PIN_OK) == LOW) done = true;
+    delay(20);
+  }
+#if PIN_BUZZER >= 0
+  digitalWrite(PIN_BUZZER, LOW);
+#endif
+  while (digitalRead(PIN_OK) == LOW) delay(10);
+  delay(300);
+  if (bk) { memcpy(display.getBuffer(), bk, 1024); free(bk); }
+  alarmBusy = false;
+}
+
+void alarmCheck() {
+  if (alMode == 0 || alarmBusy) return;
+  static unsigned long last = 0;
+  if (millis() - last < 200) return;
+  last = millis();
+  bool due = false;
+  if (alMode == 1) due = (long)(millis() - alAtMs) >= 0;
+  else if (timeIsValid()) due = time(nullptr) >= alAtEpoch;
+  if (due) { uint8_t k = alMode; alMode = 0; alarmRing(k); }
+}
+
+// Todas las apps dibujan con flushScreen(): asi la alarma suena en cualquier app
+void flushScreen() { alarmCheck(); display.display(); }
+
+// ---------- EDITOR DE NUMEROS (n=2: HH:MM, n=5: HH:MM DD/MM/AAAA) ----------
+void drawNum(int x, int y, int val, uint8_t digs, bool sel) {
+  char b[8]; snprintf(b, sizeof b, "%0*d", (int)digs, val);
+  if (sel) { display.fillRect(x - 1, y - 1, digs * 12 + 1, 17, SSD1306_WHITE); display.setTextColor(SSD1306_BLACK); }
+  else display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(2); display.setCursor(x, y); display.print(b);
+  display.setTextColor(SSD1306_WHITE);
+}
+
+bool editNums(const char* title, int* v, const int* lo, const int* hi, uint8_t n) {
+  uint8_t f = 0; delay(250);
+  while (true) {
+    if (digitalRead(PIN_ESC) == LOW) { waitEsc(); return false; }
+    int jx = getJoyX(), jy = getJoyY();
+    if (jy > 700) { v[f] = v[f] >= hi[f] ? lo[f] : v[f] + 1; delay(140); }
+    else if (jy < 300) { v[f] = v[f] <= lo[f] ? hi[f] : v[f] - 1; delay(140); }
+    else if (jx < 300) { f = (f + 1) % n; delay(220); }
+    else if (jx > 700) { f = (f + n - 1) % n; delay(220); }
+    if (digitalRead(PIN_OK) == LOW) { delay(300); return true; }
+    display.clearDisplay(); display.setTextSize(1); display.setTextColor(SSD1306_WHITE);
+    display.setCursor(0, 0); display.print(title);
+    int ty = n == 5 ? 14 : 24;
+    if (n == 3) {
+      drawNum(16, ty, v[0], 2, f == 0);
+      display.setTextSize(2); display.setCursor(40, ty); display.print(F(":"));
+      drawNum(52, ty, v[1], 2, f == 1);
+      display.setTextSize(2); display.setCursor(76, ty); display.print(F(":"));
+      drawNum(88, ty, v[2], 2, f == 2);
+    } else {
+      drawNum(34, ty, v[0], 2, f == 0);
+      display.setTextSize(2); display.setCursor(58, ty); display.print(F(":"));
+      drawNum(70, ty, v[1], 2, f == 1);
+    }
+    if (n == 5) {
+      drawNum(4, 36, v[2], 2, f == 2);
+      display.setTextSize(2); display.setCursor(28, 36); display.print(F("/"));
+      drawNum(40, 36, v[3], 2, f == 3);
+      display.setTextSize(2); display.setCursor(64, 36); display.print(F("/"));
+      drawNum(76, 36, v[4], 4, f == 4);
+    }
+    display.setTextSize(1); display.setCursor(0, 56);
+    display.print(isEnglish ? F("Stick:edit  1:OK  2:back") : F("Stick:editar 1:OK 2:salir"));
+    flushScreen();
+  }
+}
+
+// Pista de boton: [texto] (n) [texto], centrada en la fila y
+void drawKeyHint(int y, char digit, const char* pre, const char* post) {
+  int wp = pre[0] ? (int)strlen(pre) * 6 + 5 : 0, wq = post[0] ? (int)strlen(post) * 6 + 5 : 0;
+  int x0 = (128 - (wp + 13 + wq)) / 2;
+  display.setTextSize(1); display.setTextColor(SSD1306_WHITE);
+  if (pre[0]) { display.setCursor(x0, y + 3); display.print(pre); }
+  int cx = x0 + wp + 6, cy = y + 6;
+  display.drawCircle(cx, cy, 6, SSD1306_WHITE);
+  display.setCursor(cx - 2, cy - 3); display.print(digit);
+  if (post[0]) { display.setCursor(x0 + wp + 13 + 5, y + 3); display.print(post); }
+}
+
+void clockCurrent(int* y, int* mo, int* d, int* h, int* m) {
+  *y = 2026; *mo = 1; *d = 1; *h = 12; *m = 0;
+  if (timeIsValid()) { struct tm t; getLocal(&t); *y = t.tm_year + 1900; *mo = t.tm_mon + 1; *d = t.tm_mday; *h = t.tm_hour; *m = t.tm_min; }
+  else {                                                   // sin hora: usa la fecha en que se compilo el programa
+    static const char* const mn = "JanFebMarAprMayJunJulAugSepOctNovDec";
+    char mon[4] = {0, 0, 0, 0}; int dd = 1, yy = 2026;
+    if (sscanf(__DATE__, "%3s %d %d", mon, &dd, &yy) == 3) {
+      const char* p = strstr(mn, mon); if (p) *mo = (int)(p - mn) / 3 + 1;
+      *d = dd; *y = yy;
+    }
+  }
+}
+
+int daysInMonth(int y, int m) {
+  static const uint8_t dim[12] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+  if (m == 2 && ((y % 4 == 0 && y % 100 != 0) || y % 400 == 0)) return 29;
+  return dim[m - 1];
+}
+
+// Pantalla de hora: HH : MM (y AM/PM si el formato es de 12 h)
+bool clockEditTime(int* h24, int* mm) {
+  int pm = *h24 >= 12 ? 1 : 0, m = *mm, hv = *h24;
+  if (!clock24) { hv = *h24 % 12; if (hv == 0) hv = 12; }
+  uint8_t f = 0, n = clock24 ? 2 : 3; delay(250);
+  while (true) {
+    if (digitalRead(PIN_ESC) == LOW) { waitEsc(); return false; }
+    int jx = getJoyX(), jy = getJoyY();
+    int lo = clock24 ? 0 : 1, hi = clock24 ? 23 : 12;
+    if (jy > 700 || jy < 300) {
+      int dir = (jy > 700) ? 1 : -1;
+      if (f == 0) { hv += dir; if (hv > hi) hv = lo; if (hv < lo) hv = hi; }
+      else if (f == 1) { m += dir; if (m > 59) m = 0; if (m < 0) m = 59; }
+      else pm ^= 1;
+      delay(150);
+    } else if (jx < 300) { f = (f + 1) % n; delay(220); }
+    else if (jx > 700) { f = (f + n - 1) % n; delay(220); }
+    if (digitalRead(PIN_OK) == LOW) { delay(300); break; }
+    display.clearDisplay(); display.setTextColor(SSD1306_WHITE);
+    display.setTextSize(1);
+    const char* t = isEnglish ? "SET THE TIME" : "PONER LA HORA";
+    display.setCursor(64 - strlen(t) * 3, 2); display.print(t);
+    int xh = clock24 ? 34 : 10, xm = clock24 ? 70 : 46;
+    display.setCursor(xh + 6, 17); display.print(F("HH"));
+    display.setCursor(xm + 6, 17); display.print(F("MM"));
+    drawNum(xh, 28, hv, 2, f == 0);
+    display.setTextSize(2); display.setCursor(xh + 24, 28); display.print(F(":"));
+    drawNum(xm, 28, m, 2, f == 1);
+    if (!clock24) {
+      display.setTextSize(1); display.setCursor(82, 17); display.print(F("AM/PM"));
+      if (f == 2) { display.fillRect(81, 27, 25, 17, SSD1306_WHITE); display.setTextColor(SSD1306_BLACK); }
+      display.setTextSize(2); display.setCursor(82, 28); display.print(pm ? F("PM") : F("AM"));
+      display.setTextColor(SSD1306_WHITE);
+    }
+    drawKeyHint(50, '1', isEnglish ? "Press" : "Pulsa", "");
+    flushScreen();
+  }
+  *h24 = clock24 ? hv : (hv % 12) + (pm ? 12 : 0);
+  *mm = m;
+  return true;
+}
+
+// Pantalla de fecha: DD / MM / AAAA
+bool clockEditDate(int* yy, int* mo, int* dd) {
+  int y = *yy, m = *mo, d = *dd; uint8_t f = 0; delay(250);
+  while (true) {
+    if (digitalRead(PIN_ESC) == LOW) { waitEsc(); return false; }
+    int jx = getJoyX(), jy = getJoyY();
+    if (jy > 700 || jy < 300) {
+      int dir = (jy > 700) ? 1 : -1;
+      if (f == 0) { d += dir; int mx = daysInMonth(y, m); if (d > mx) d = 1; if (d < 1) d = mx; }
+      else if (f == 1) { m += dir; if (m > 12) m = 1; if (m < 1) m = 12; }
+      else { y += dir; if (y > 2099) y = 2024; if (y < 2024) y = 2099; }
+      int mx = daysInMonth(y, m); if (d > mx) d = mx;
+      delay(150);
+    } else if (jx < 300) { f = (f + 1) % 3; delay(220); }
+    else if (jx > 700) { f = (f + 2) % 3; delay(220); }
+    if (digitalRead(PIN_OK) == LOW) { delay(300); break; }
+    display.clearDisplay(); display.setTextColor(SSD1306_WHITE);
+    display.setTextSize(1);
+    const char* t = isEnglish ? "SET THE DATE" : "PONER LA FECHA";
+    display.setCursor(64 - strlen(t) * 3, 2); display.print(t);
+    display.setCursor(10, 17); display.print(F("DD"));
+    display.setCursor(46, 17); display.print(F("MM"));
+    display.setCursor(isEnglish ? 82 : 82, 17); display.print(isEnglish ? F("YYYY") : F("AAAA"));
+    drawNum(4, 28, d, 2, f == 0);
+    display.setTextSize(2); display.setCursor(28, 28); display.print(F("/"));
+    drawNum(40, 28, m, 2, f == 1);
+    display.setTextSize(2); display.setCursor(64, 28); display.print(F("/"));
+    drawNum(76, 28, y, 4, f == 2);
+    drawKeyHint(50, '1', isEnglish ? "Press" : "Pulsa", "");
+    flushScreen();
+  }
+  *yy = y; *mo = m; *dd = d;
+  return true;
+}
+
+void clockSetTimeOnly() {
+  int y, mo, d, h, m; clockCurrent(&y, &mo, &d, &h, &m);
+  if (clockEditTime(&h, &m)) { setManualTime(y, mo, d, h, m); clockMsg(isEnglish ? "Time saved" : "Hora guardada", "", 900); }
+}
+
+void clockSetDateOnly() {
+  int y, mo, d, h, m; clockCurrent(&y, &mo, &d, &h, &m);
+  if (clockEditDate(&y, &mo, &d)) { setManualTime(y, mo, d, h, m); clockMsg(isEnglish ? "Date saved" : "Fecha guardada", "", 900); }
+}
+
+// Primera configuracion manual: hora y despues fecha
+void clockSetManual() {
+  int y, mo, d, h, m; clockCurrent(&y, &mo, &d, &h, &m);
+  if (!clockEditTime(&h, &m)) return;
+  if (!clockEditDate(&y, &mo, &d)) return;
+  setManualTime(y, mo, d, h, m);
+  clockMsg(isEnglish ? "Saved" : "Guardado", "", 900);
+}
+
+void clockAlarmMenu() {
+  uint8_t sel = 0; delay(250);
+  while (digitalRead(PIN_ESC) == HIGH) {
+    uint8_t nIt = alMode ? 3 : 2;
+    if (sel >= nIt) sel = 0;
+    int jy = getJoyY();
+    if (jy > 700) { sel = (sel + nIt - 1) % nIt; delay(180); }
+    else if (jy < 300) { sel = (sel + 1) % nIt; delay(180); }
+    if (digitalRead(PIN_OK) == LOW) {
+      delay(300);
+      if (sel == 0) {                                   // suena dentro de un tiempo
+        int v[3] = {alDH, alDM, alDS}; const int lo[3] = {0, 0, 0}, hi[3] = {23, 59, 59};
+        if (editNums(isEnglish ? "Ring in (H:M:S)" : "Sonar en (H:M:S)", v, lo, hi, 3)) {
+          if (v[0] + v[1] + v[2] == 0) clockMsg(isEnglish ? "Pick a time" : "Pon un tiempo", isEnglish ? "above zero" : "mayor que cero", 1300);
+          else {
+            alDH = v[0]; alDM = v[1]; alDS = v[2];
+            alAtMs = millis() + ((unsigned long)alDH * 3600UL + alDM * 60UL + alDS) * 1000UL; alMode = 1;
+            char b[16]; snprintf(b, sizeof b, "%d:%02d:%02d", alDH, alDM, alDS);
+            clockMsg(isEnglish ? "Alarm in" : "Alarma en", b, 1400);
+          }
+        }
+      } else if (sel == 1) {                            // suena a una hora exacta
+        if (!timeIsValid()) { clockMsg(isEnglish ? "Set the time" : "Primero pon", isEnglish ? "first (Time)" : "la hora (Hora)", 1600); }
+        else {
+          int v[2] = {alH, alM}; const int lo[2] = {0, 0}, hi[2] = {23, 59};
+          if (editNums(isEnglish ? "Alarm at (24h)" : "Alarma a las (24h)", v, lo, hi, 2)) {
+            alH = v[0]; alM = v[1];
+            long nowE = (long)time(nullptr), loc = nowE + tzOffset, mid = loc - (loc % 86400L);
+            alAtEpoch = (time_t)(mid + alH * 3600L + alM * 60L - tzOffset);
+            if (alAtEpoch <= nowE) alAtEpoch += 86400L;
+            alMode = 2;
+            char b[8]; snprintf(b, sizeof b, "%02d:%02d", alH, alM);
+            clockMsg(isEnglish ? "Alarm set for" : "Alarma puesta a", b, 1300);
+          }
+        }
+      } else { alMode = 0; sel = 0; clockMsg(isEnglish ? "Alarm off" : "Alarma apagada", "", 900); }
+    }
+    const char* itES[3] = {"En un tiempo...", "A una hora...", "Cancelar alarma"};
+    const char* itEN[3] = {"In some time...", "At a time...", "Cancel alarm"};
+    drawMenu(isEnglish ? "ALARM" : "ALARMA", isEnglish ? itEN : itES, nIt, sel);
+    char st[24];
+    if (alMode == 1) {
+      long sl = ((long)(alAtMs - millis())) / 1000; if (sl < 0) sl = 0;
+      snprintf(st, sizeof st, "%ld:%02ld:%02ld", sl / 3600, (sl / 60) % 60, sl % 60);
+    } else if (alMode == 2) snprintf(st, sizeof st, "%02d:%02d", alH, alM);
+    else snprintf(st, sizeof st, "OFF");
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(128 - (int)strlen(st) * 6, 0);
+    display.print(st);
+    flushScreen();
+  }
+  waitEsc();
+}
+
+void clockTzMenu() {
+  delay(250);
+  while (digitalRead(PIN_ESC) == HIGH) {
+    int jy = getJoyY();
+    if (jy > 700) { if (tzOffset < 14 * 3600L) tzOffset += 1800; tzAuto = false; delay(160); }
+    else if (jy < 300) { if (tzOffset > -12 * 3600L) tzOffset -= 1800; tzAuto = false; delay(160); }
+    if (digitalRead(PIN_OK) == LOW) {
+      delay(300);
+      clockMsg(isEnglish ? "Detecting..." : "Detectando...", "", 1);
+      if (fetchTimezone()) { tzAuto = true; tzDone = true; }
+      else clockMsg(isEnglish ? "No internet" : "Sin internet", isEnglish ? "use stick" : "usa el joystick", 1400);
+    }
+    long a = tzOffset < 0 ? -tzOffset : tzOffset;
+    char b[24]; snprintf(b, sizeof b, "UTC%c%d:%02d", tzOffset < 0 ? '-' : '+', (int)(a / 3600), (int)((a % 3600) / 60));
+    display.clearDisplay(); display.setTextColor(SSD1306_WHITE);
+    display.setTextSize(1); display.setCursor(0, 0); display.print(isEnglish ? F("TIME ZONE") : F("ZONA HORARIA"));
+    display.setTextSize(2); display.setCursor(64 - strlen(b) * 6, 18); display.print(b);
+    display.setTextSize(1); display.setCursor(0, 40); display.print(tzAuto ? (isEnglish ? F("Auto-detected") : F("Auto (internet)")) : (isEnglish ? F("Manual") : F("Manual")));
+    display.setCursor(0, 56); display.print(isEnglish ? F("Up/Dn:+-30m 1:auto 2:ok") : F("Arr/Abj 1:auto 2:ok"));
+    flushScreen();
+  }
+  waitEsc(); clockSave();
+}
+
+void clockSync() {
+  if (WiFi.status() != WL_CONNECTED) { clockMsg(isEnglish ? "No Wi-Fi" : "Sin Wi-Fi", isEnglish ? "Connect in Settings" : "Conecta en Ajustes", 1600); return; }
+  clockMsg(isEnglish ? "Syncing..." : "Sincronizando...", "", 1);
+  ntpKick();
+  if (tzAuto && fetchTimezone()) { tzDone = true; clockSave(); }
+  unsigned long t0 = millis();
+  while (!timeIsValid() && millis() - t0 < 6000) delay(100);
+  if (timeIsValid()) { timeManual = false; clockMsg(isEnglish ? "Time updated" : "Hora actualizada", isEnglish ? "from internet" : "desde internet", 1300); }
+  else clockMsg(isEnglish ? "No response" : "Sin respuesta", isEnglish ? "try again" : "intenta de nuevo", 1300);
+}
+
+void clockMenu() {
+  uint8_t sel = 0; delay(250);
+  while (digitalRead(PIN_ESC) == HIGH) {
+    int jy = getJoyY();
+    if (jy > 700) { sel = (sel + 2) % 3; delay(180); } else if (jy < 300) { sel = (sel + 1) % 3; delay(180); }
+    if (digitalRead(PIN_OK) == LOW) {
+      delay(300);
+      if (sel == 0) clockSetTimeOnly();
+      else if (sel == 1) clockSetDateOnly();
+      else {
+        uint8_t f = pickTwo(isEnglish ? "TIME FORMAT" : "FORMATO DE HORA", isEnglish ? "24 hours" : "24 horas", isEnglish ? "12 hours (AM/PM)" : "12 horas (AM/PM)");
+        if (f != 255) { clock24 = (f == 0); clockSave(); }
+      }
+      delay(150);
+    }
+    const char* it[3] = { isEnglish ? "Change time" : "Cambiar hora", isEnglish ? "Change date" : "Cambiar fecha", isEnglish ? "Change format" : "Cambiar formato" };
+    display.clearDisplay(); display.setTextSize(1); display.setTextColor(SSD1306_WHITE);
+    display.setCursor(0, 0); display.print(isEnglish ? F("OPTIONS") : F("OPCIONES"));
+    for (uint8_t i = 0; i < 3; i++) {
+      int y = 16 + i * 15;
+      if (i == sel) { display.fillRoundRect(4, y - 3, 120, 14, 3, SSD1306_WHITE); display.setTextColor(SSD1306_BLACK); }
+      else display.setTextColor(SSD1306_WHITE);
+      display.setCursor(64 - strlen(it[i]) * 3, y); display.print(it[i]);
+    }
+    display.setTextColor(SSD1306_WHITE);
+    flushScreen();
+  }
+  waitEsc();
+}
+
+// ---------- 1) CRONOMETRO (el de siempre) ----------
+void runStopwatch() {
+  delay(250);
+  while (digitalRead(PIN_ESC) == HIGH) {
+    if (swRun) swEl = millis() - swStart;
+    unsigned long elapsed = swEl / 1000;
+    display.clearDisplay();
+    display.drawRect(0, 0, 128, 64, SSD1306_WHITE);
+    display.drawCircle(35, 32, 22, SSD1306_WHITE);
+    display.drawCircle(35, 32, 19, SSD1306_WHITE);
+    display.fillRect(33, 6, 5, 4, SSD1306_WHITE);
+    display.drawPixel(35, 17, SSD1306_WHITE);
+    display.drawPixel(35, 47, SSD1306_WHITE);
+    float angle = (elapsed % 60) * 0.1047;
+    display.drawLine(35, 32, 35 + cos(angle - 1.57) * 14, 32 + sin(angle - 1.57) * 14, SSD1306_WHITE);
+    display.setTextSize(2); display.setCursor(72, 16);
+    if (elapsed < 10) display.print(F("0"));
+    display.print((int)elapsed);
+    display.setTextSize(1); display.print(F("s"));
+    display.drawRoundRect(70, 40, 50, 16, 3, SSD1306_WHITE);
+    display.setCursor(swRun ? 79 : 76, 44);
+    if (isEnglish) display.print(swRun ? F("STOP") : F("START"));
+    else display.print(swRun ? F("PARAR") : F("INICIO"));
+    if (digitalRead(PIN_OK) == LOW) {
+      if (!swRun) { swStart = millis() - swEl; swRun = true; } else { swEl = millis() - swStart; swRun = false; }
+      delay(300);
+    }
+    if (digitalRead(PIN_4) == LOW) { if (!swRun) swEl = 0; delay(250); }
+    flushScreen();
+  }
+  waitEsc();
+}
+
+// ---------- 2) HORA ----------
+void clockDraw() {
+  display.clearDisplay(); display.setTextColor(SSD1306_WHITE);
+  static const char* const wdEs[7] = {"Domingo", "Lunes", "Martes", "Miercoles", "Jueves", "Viernes", "Sabado"};
+  static const char* const wdEn[7] = {"Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"};
+  char b[32]; bool ok = timeIsValid();
+  display.setTextSize(1);
+  display.setCursor(2, 1); display.print(WiFi.status() == WL_CONNECTED ? F("NET") : (timeManual ? F("MAN") : F("---")));
+  if (alMode) { display.drawCircle(121, 4, 3, SSD1306_WHITE); display.drawFastHLine(118, 8, 7, SSD1306_WHITE); }
+  if (ok) {
+    struct tm t; getLocal(&t);
+    const char* ap = hourStr(b, t.tm_hour, t.tm_min);
+    int wt = (int)strlen(b) * 18;                                  // hora grande, centrada con los segundos
+    int x0 = (128 - (wt + 20)) / 2;
+    display.setTextSize(3); display.setCursor(x0, 11); display.print(b);
+    display.setTextSize(1);
+    char sc[6]; snprintf(sc, sizeof sc, "%02d", t.tm_sec);
+    display.setCursor(x0 + wt + 3, 26); display.print(sc);
+    if (ap[0]) { display.setCursor(x0 + wt + 3, 14); display.print(ap); }
+    snprintf(b, sizeof b, "%s %02d/%02d/%04d", (isEnglish ? wdEn : wdEs)[t.tm_wday], t.tm_mday, t.tm_mon + 1, t.tm_year + 1900);
+    display.setCursor(64 - strlen(b) * 3, 38); display.print(b);
+    display.drawFastHLine(20, 35, 88, SSD1306_WHITE);
+  } else {
+    display.setTextSize(3); display.setCursor(19, 11); display.print(F("--:--"));
+    const char* m = isEnglish ? "No time set" : "Sin hora";
+    display.setTextSize(1); display.setCursor(64 - strlen(m) * 3, 38); display.print(m);
+  }
+  drawKeyHint(50, '3', "", isEnglish ? "Options" : "Opciones");
+}
+
+// Lista de 2 opciones. Devuelve 0, 1 o 255 si se sale con el boton 2
+uint8_t pickTwo(const char* title, const char* a, const char* b, uint8_t start) {
+  uint8_t sel = start ? 1 : 0; delay(250);
+  while (true) {
+    if (digitalRead(PIN_ESC) == LOW) { waitEsc(); return 255; }
+    int jy = getJoyY();
+    if (jy > 700 || jy < 300) { sel ^= 1; delay(200); }
+    if (digitalRead(PIN_OK) == LOW) { delay(300); return sel; }
+    display.clearDisplay(); display.setTextSize(1); display.setTextColor(SSD1306_WHITE);
+    display.setCursor(0, 0); display.print(title);
+    const char* it[2] = {a, b};
+    for (uint8_t i = 0; i < 2; i++) {
+      int y = 18 + i * 17;
+      if (i == sel) { display.fillRoundRect(4, y - 3, 120, 14, 3, SSD1306_WHITE); display.setTextColor(SSD1306_BLACK); }
+      else { display.drawRoundRect(4, y - 3, 120, 14, 3, SSD1306_WHITE); display.setTextColor(SSD1306_WHITE); }
+      display.setCursor(64 - strlen(it[i]) * 3, y); display.print(it[i]);
+    }
+    display.setTextColor(SSD1306_WHITE);
+    flushScreen();
+  }
+}
+
+void runClockScreen() {
+  if (!clockFmtDone) {                                   // primera vez: formato
+    uint8_t f = pickTwo(isEnglish ? "TIME FORMAT" : "FORMATO DE HORA", isEnglish ? "24 hours" : "24 horas", isEnglish ? "12 hours (AM/PM)" : "12 horas (AM/PM)");
+    if (f == 255) return;
+    clock24 = (f == 0); clockFmtDone = true; clockSave();
+  }
+  if (!timeIsValid()) {                                  // sin hora: por red o manual
+    uint8_t m = pickTwo(isEnglish ? "SET THE TIME" : "PONER LA HORA", isEnglish ? "From network" : "Por red (internet)", isEnglish ? "Manual" : "Manual");
+    if (m == 255) return;
+    if (m == 0) clockSync(); else clockSetManual();
+  }
+  if (tzAuto && !tzDone && WiFi.status() == WL_CONNECTED) {
+    clockMsg(isEnglish ? "Getting time zone" : "Buscando zona", "", 1);
+    if (fetchTimezone()) { tzDone = true; clockSave(); }
+  }
+  delay(250);
+  while (digitalRead(PIN_ESC) == HIGH) {
+    if (digitalRead(PIN_3) == LOW) { delay(250); clockMenu(); }
+    clockDraw(); flushScreen();
+  }
+  waitEsc();
+}
+
+// ---------- APP RELOJ: 3 opciones ----------
+void runAdvancedTimer() {
+  uint8_t sel = 0; delay(250);
+  while (digitalRead(PIN_ESC) == HIGH) {
+    int jy = getJoyY();
+    if (jy > 700) { sel = (sel + 2) % 3; delay(180); } else if (jy < 300) { sel = (sel + 1) % 3; delay(180); }
+    if (digitalRead(PIN_OK) == LOW) {
+      delay(300);
+      if (sel == 0) runStopwatch();
+      else if (sel == 1) runClockScreen();
+      else clockAlarmMenu();
+      delay(150);
+    }
+    const char* it[3] = { isEnglish ? "Stopwatch" : "Cronometro", isEnglish ? "Time" : "Hora", isEnglish ? "Alarm" : "Alarma" };
+    display.clearDisplay(); display.setTextSize(1); display.setTextColor(SSD1306_WHITE);
+    display.setCursor(0, 0); display.print(isEnglish ? F("CLOCK") : F("RELOJ"));
+    if (swRun) { display.setCursor(54, 0); display.print(isEnglish ? F("SW running") : F("Crono activo")); }
+    for (uint8_t i = 0; i < 3; i++) {
+      int y = 14 + i * 16;
+      if (i == sel) { display.fillRoundRect(4, y - 3, 120, 14, 3, SSD1306_WHITE); display.setTextColor(SSD1306_BLACK); }
+      else display.setTextColor(SSD1306_WHITE);
+      display.setTextSize(1); display.setCursor(64 - strlen(it[i]) * 3, y); display.print(it[i]);
+    }
+    display.setTextColor(SSD1306_WHITE);
+    flushScreen();
+  }
+  currentApp = -1; delay(300);
+}
+
+// ---------- Para la barra de estado del escritorio ----------
+bool clockStatusText(char* b) {            // b >= 12
+  if (!timeIsValid()) return false;
+  struct tm t; getLocal(&t);
+  char hb[8]; const char* ap = hourStr(hb, t.tm_hour, t.tm_min);
+  snprintf(b, 12, "%s%s", hb, ap);
+  return true;
+}
+
+bool alarmIsOn() { return alMode != 0; }
